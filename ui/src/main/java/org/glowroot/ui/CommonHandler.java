@@ -244,11 +244,17 @@ public class CommonHandler {
         return handleStaticResource(path, request);
     }
 
-    // used by the mcp server to dispatch read-only tool calls to the same http/json services (and
-    // permission checks) that back the UI
+    // used by the mcp server to dispatch tool calls to the same http/json services (and permission
+    // checks) that back the UI
     CommonResponse handleInternalGet(String path, Map<String, List<String>> parameters,
             Authentication authentication) throws Exception {
-        return handleRequest(new InternalGetRequest(path, parameters), authentication);
+        return handleRequest(new InternalRequest("GET", path, parameters, ""), authentication);
+    }
+
+    CommonResponse handleInternalPost(String path, Map<String, List<String>> parameters,
+            String content, Authentication authentication) throws Exception {
+        return handleRequest(new InternalRequest("POST", path, parameters, content),
+                authentication);
     }
 
     private @Nullable HttpService getHttpService(String path) {
@@ -605,13 +611,18 @@ public class CommonHandler {
                 && Boolean.valueOf(autoRefreshParams.get(0));
     }
 
-    private static class InternalGetRequest implements CommonRequest {
+    private static class InternalRequest implements CommonRequest {
 
+        private final String method;
         private final String path;
         private final Map<String, List<String>> parameters;
+        private final String content;
 
-        private InternalGetRequest(String path, Map<String, List<String>> parameters) {
+        private InternalRequest(String method, String path, Map<String, List<String>> parameters,
+                String content) {
+            this.method = method;
             this.path = path;
+            this.content = content;
             // needs to be mutable since json service binding removes the bound parameters
             this.parameters = Maps.newHashMap();
             for (Map.Entry<String, List<String>> entry : parameters.entrySet()) {
@@ -621,7 +632,7 @@ public class CommonHandler {
 
         @Override
         public String getMethod() {
-            return "GET";
+            return method;
         }
 
         @Override
@@ -660,7 +671,7 @@ public class CommonHandler {
 
         @Override
         public String getContent() {
-            return "";
+            return content;
         }
     }
 

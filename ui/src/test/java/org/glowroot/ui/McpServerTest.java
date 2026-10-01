@@ -21,6 +21,7 @@ import java.util.Map;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Strings;
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.BaseEncoding;
@@ -97,7 +98,7 @@ public class McpServerTest {
     }
 
     @Test
-    public void shouldListReadOnlyTools() throws Exception {
+    public void shouldListTools() throws Exception {
         CommonResponse response = embedded().handle(
                 post(basic("alice", "secret"),
                         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"),
@@ -108,8 +109,10 @@ public class McpServerTest {
         assertThat(names).contains("list_agents", "list_transaction_types",
                 "get_transaction_summaries", "get_transaction_overview", "list_traces",
                 "get_trace", "list_gauges", "get_gauge_values");
+        assertThat(names).contains("set_slow_trace_threshold", "create_gauge",
+                "create_instrumentation", "apply_instrumentation_changes");
         for (JsonNode tool : tools) {
-            assertThat(tool.at("/annotations/readOnlyHint").asBoolean()).isTrue();
+            assertThat(tool.at("/annotations/readOnlyHint").isBoolean()).isTrue();
             assertThat(tool.at("/inputSchema/type").asText()).isEqualTo("object");
         }
     }
@@ -227,8 +230,11 @@ public class McpServerTest {
 
         JsonNode result = json(response).path("result");
         assertThat(result.path("isError").asBoolean()).isFalse();
-        assertThat(result.at("/content/0/text").asText())
-                .isEqualTo("{\"overall\":{},\"transactions\":[]}");
+        JsonNode text = mapper.readTree(result.at("/content/0/text").asText());
+        assertThat(text.has("overall")).isTrue();
+        assertThat(text.path("glowrootUrl").asText()).isEqualTo(
+                "http://localhost:4000/o/glowroot/transaction/average?transaction-type=Web"
+                        + "&from=" + (NOW - 3600000) + "&to=" + NOW);
     }
 
     @Test
@@ -371,6 +377,202 @@ public class McpServerTest {
     }
 
     @Test
+    public void shouldAnnotateWriteAndDeleteTools() throws Exception {
+        CommonResponse response = embedded().handle(
+                post(basic("alice", "secret"),
+                        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"),
+                commonHandler);
+
+        JsonNode tools = json(response).at("/result/tools");
+        assertThat(annotations(tools, "get_trace").path("readOnlyHint").asBoolean()).isTrue();
+        JsonNode createGauge = annotations(tools, "create_gauge");
+        assertThat(createGauge.path("readOnlyHint").asBoolean()).isFalse();
+        assertThat(createGauge.path("destructiveHint").asBoolean()).isFalse();
+        JsonNode deleteGauge = annotations(tools, "delete_gauge");
+        assertThat(deleteGauge.path("readOnlyHint").asBoolean()).isFalse();
+        assertThat(deleteGauge.path("destructiveHint").asBoolean()).isTrue();
+        assertThat(annotations(tools, "apply_instrumentation_changes").path("readOnlyHint")
+                .asBoolean()).isFalse();
+    }
+
+    @Test
+    public void shouldSetDefaultSlowTraceThresholdKeepingVersionAndOverrides() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/transaction"), anyMap(),
+                eq(user))).thenReturn(ok(TRANSACTION_CONFIG));
+        when(commonHandler.handleInternalPost(eq("/backend/config/transaction"), anyMap(),
+                anyString(), eq(user))).thenReturn(ok(TRANSACTION_CONFIG));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("set_slow_trace_threshold", "{\"thresholdMillis\":500}")),
+                commonHandler);
+
+        JsonNode body = capturePostBody("/backend/config/transaction");
+        assertThat(body.path("slowThresholdMillis").asInt()).isEqualTo(500);
+        assertThat(body.path("version").asText()).isEqualTo("v1");
+        assertThat(body.path("slowThresholdOverrides").size()).isEqualTo(1);
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("change").asText()).contains("2000 ms -> 500 ms");
+        assertThat(text.path("glowrootUrl").asText())
+                .isEqualTo("http://localhost:4000/o/glowroot/config/transaction");
+    }
+
+    @Test
+    public void shouldUpdateAndAddSlowTraceThresholdOverrides() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/transaction"), anyMap(),
+                eq(user))).thenReturn(ok(TRANSACTION_CONFIG));
+        when(commonHandler.handleInternalPost(eq("/backend/config/transaction"), anyMap(),
+                anyString(), eq(user))).thenReturn(ok(TRANSACTION_CONFIG));
+
+        embedded().handle(post(basic("alice", "secret"),
+                toolCall("set_slow_trace_threshold", "{\"thresholdMillis\":100,"
+                        + "\"transactionType\":\"Web\",\"transactionName\":\"/home\"}")),
+                commonHandler);
+
+        JsonNode overrides = capturePostBody("/backend/config/transaction")
+                .path("slowThresholdOverrides");
+        assertThat(overrides.size()).isEqualTo(1);
+        assertThat(overrides.at("/0/thresholdMillis").asInt()).isEqualTo(100);
+    }
+
+    @Test
+    public void shouldCreateGauge() throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/gauges/add"), anyMap(),
+                anyString(), eq(user))).thenReturn(ok("{\"config\":{\"version\":\"g1\"}}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_gauge", "{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"attributes\":[\"Active\",\"Served\"],"
+                        + "\"counterAttributes\":[\"Served\"]}")),
+                commonHandler);
+
+        JsonNode body = capturePostBody("/backend/config/gauges/add");
+        assertThat(body.path("mbeanObjectName").asText()).isEqualTo("app:type=Pool");
+        assertThat(body.at("/mbeanAttributes/0/counter").asBoolean()).isFalse();
+        assertThat(body.at("/mbeanAttributes/1/name").asText()).isEqualTo("Served");
+        assertThat(body.at("/mbeanAttributes/1/counter").asBoolean()).isTrue();
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.at("/gaugeNames/1").asText()).isEqualTo("app:type=Pool:Served[counter]");
+        assertThat(text.path("glowrootUrl").asText())
+                .isEqualTo("http://localhost:4000/o/glowroot/config/gauge?v=g1");
+        assertThat(text.path("gaugeValuesUrl").asText()).startsWith(
+                "http://localhost:4000/o/glowroot/jvm/gauges?gauge-name=app%3Atype%3DPool%3AActive"
+                        + "&gauge-name=app%3Atype%3DPool%3AServed%5Bcounter%5D&from=");
+    }
+
+    @Test
+    public void shouldCreateTransactionInstrumentationWithDefaults() throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/instrumentation/add"),
+                anyMap(), anyString(), eq(user)))
+                        .thenReturn(ok("{\"config\":{\"version\":\"i1\"}}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Job\","
+                        + "\"methodName\":\"run\",\"captureKind\":\"transaction\","
+                        + "\"transactionType\":\"Background\"}")),
+                commonHandler);
+
+        JsonNode body = capturePostBody("/backend/config/instrumentation/add");
+        assertThat(body.path("captureKind").asText()).isEqualTo("transaction");
+        assertThat(body.at("/methodParameterTypes/0").asText()).isEqualTo("..");
+        assertThat(body.path("timerName").asText()).isEqualTo("Job.run");
+        assertThat(body.path("traceEntryMessageTemplate").asText())
+                .isEqualTo("Job.{{methodName}}()");
+        assertThat(body.path("transactionType").asText()).isEqualTo("Background");
+        assertThat(body.path("transactionNameTemplate").asText())
+                .isEqualTo("Job.{{methodName}}");
+        assertThat(body.path("alreadyInTransactionBehavior").asText())
+                .isEqualTo("capture-trace-entry");
+        assertThat(body.path("transactionSlowThresholdMillis").isNull()).isTrue();
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("glowrootUrl").asText())
+                .isEqualTo("http://localhost:4000/o/glowroot/config/instrumentation?v=i1");
+        assertThat(text.path("nextStep").asText()).contains("apply_instrumentation_changes");
+    }
+
+    @Test
+    public void shouldCreateTimerInstrumentationWithoutTraceEntryOrTransactionFields()
+            throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/instrumentation/add"),
+                anyMap(), anyString(), eq(user)))
+                        .thenReturn(ok("{\"config\":{\"version\":\"i2\"}}"));
+
+        embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Dao\","
+                        + "\"methodName\":\"find*\",\"captureKind\":\"timer\","
+                        + "\"timerName\":\"dao\",\"transactionType\":\"ignored\"}")),
+                commonHandler);
+
+        JsonNode body = capturePostBody("/backend/config/instrumentation/add");
+        assertThat(body.path("timerName").asText()).isEqualTo("dao");
+        assertThat(body.path("traceEntryMessageTemplate").asText()).isEmpty();
+        assertThat(body.path("transactionType").asText()).isEmpty();
+        assertThat(body.path("alreadyInTransactionBehavior").isNull()).isTrue();
+    }
+
+    @Test
+    public void shouldRequireTransactionTypeForTransactionInstrumentation() throws Exception {
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Job\","
+                        + "\"methodName\":\"run\",\"captureKind\":\"transaction\"}")),
+                commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("transactionType");
+        verify(commonHandler, never()).handleInternalPost(anyString(), anyMap(), anyString(),
+                any(Authentication.class));
+    }
+
+    @Test
+    public void shouldApplyInstrumentationChanges() throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/reweave"), anyMap(),
+                anyString(), eq(user))).thenReturn(ok("{\"classes\":3}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("apply_instrumentation_changes", "{}")), commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("classes").asInt()).isEqualTo(3);
+        assertThat(text.path("glowrootUrl").asText())
+                .isEqualTo("http://localhost:4000/o/glowroot/config/instrumentation-list");
+    }
+
+    @Test
+    public void shouldLinkEachTraceToTheUi() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/transaction/points"), anyMap(),
+                eq(user))).thenReturn(ok("{\"normalPoints\":[[123,45.6,\"\",\"abc\"]],"
+                        + "\"errorPoints\":[],\"partialPoints\":[]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("list_traces", "{\"transactionType\":\"Web\",\"from\":1,\"to\":2}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.at("/traces/0/glowrootUrl").asText()).isEqualTo(
+                "http://localhost:4000/o/glowroot/transaction/traces?transaction-type=Web"
+                        + "&from=1&to=2&modal-trace-id=abc");
+    }
+
+    @Test
+    public void shouldLinkTraceWithAgentInCentralBehindReverseProxy() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/trace/header"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"transactionType\":\"Web\",\"transactionName\":\"/home\","
+                        + "\"startTime\":3600000,\"captureTime\":3601000}"));
+        CommonRequest request = post(basic("alice", "secret"),
+                toolCall("get_trace", "{\"agentId\":\"node 1\",\"traceId\":\"abc\"}"));
+        when(request.getHeader("X-Forwarded-Proto")).thenReturn("https");
+        when(request.getHeader("X-Forwarded-Host")).thenReturn("apm.example.com, proxy");
+
+        CommonResponse response = central().handle(request, commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("glowrootUrl").asText()).isEqualTo(
+                "https://apm.example.com/o/glowroot/transaction/traces?agent-id=node%201"
+                        + "&transaction-type=Web&transaction-name=%2Fhome&from=1800000"
+                        + "&to=5401000&modal-agent-id=node%201&modal-trace-id=abc");
+    }
+
+    @Test
     public void shouldRejectTraceLookupWithAgentRollupId() throws Exception {
         CommonResponse response = central().handle(post(basic("alice", "secret"),
                 toolCall("get_trace", "{\"agentId\":\"group::\",\"traceId\":\"abc\"}")),
@@ -394,12 +596,36 @@ public class McpServerTest {
         assertThat(node.size()).isEqualTo(2);
     }
 
+    private static final String TRANSACTION_CONFIG = "{\"config\":{\"slowThresholdMillis\":2000,"
+            + "\"profilingIntervalMillis\":1000,\"captureThreadStats\":true,"
+            + "\"slowThresholdOverrides\":[{\"transactionType\":\"Web\","
+            + "\"transactionName\":\"/home\",\"user\":\"\",\"thresholdMillis\":5000}],"
+            + "\"version\":\"v1\"}}";
+
+    private JsonNode capturePostBody(String path) throws Exception {
+        ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+        verify(commonHandler).handleInternalPost(eq(path), anyMap(), captor.capture(),
+                eq(user));
+        return mapper.readTree(captor.getValue());
+    }
+
+    private static JsonNode annotations(JsonNode tools, String name) {
+        for (JsonNode tool : tools) {
+            if (tool.path("name").asText().equals(name)) {
+                return tool.path("annotations");
+            }
+        }
+        throw new AssertionError("tool not found: " + name);
+    }
+
     private McpServer embedded() {
-        return new McpServer(false, false, "0.0.1-test", httpSessionManager, clock());
+        return new McpServer(false, false, "0.0.1-test", httpSessionManager,
+                Suppliers.ofInstance(false), clock());
     }
 
     private McpServer central() {
-        return new McpServer(true, false, "0.0.1-test", httpSessionManager, clock());
+        return new McpServer(true, false, "0.0.1-test", httpSessionManager,
+                Suppliers.ofInstance(false), clock());
     }
 
     private static Clock clock() {
@@ -434,6 +660,8 @@ public class McpServerTest {
         CommonRequest request = mock(CommonRequest.class);
         when(request.getMethod()).thenReturn("POST");
         when(request.getPath()).thenReturn("/mcp");
+        when(request.getContextPath()).thenReturn("/o/glowroot/");
+        when(request.getHeader(HttpHeaderNames.HOST.toString())).thenReturn("localhost:4000");
         when(request.getHeader(HttpHeaderNames.AUTHORIZATION)).thenReturn(authorization);
         when(request.getContent()).thenReturn(content);
         return request;

@@ -224,8 +224,28 @@ public class UiModule {
             httpServices.put(Pattern.compile("^/synthetic-monitors$"), indexHtmlHttpService);
         }
 
-        McpServer mcpServer =
-                new McpServer(central, offlineViewer, version, httpSessionManager, clock);
+        // only used to build links to the UI in mcp tool results
+        Supplier<Boolean> httpsForMcpLinks;
+        if (servlet) {
+            // servlet container: scheme is only known from X-Forwarded-Proto
+            httpsForMcpLinks = Suppliers.ofInstance(false);
+        } else if (central) {
+            httpsForMcpLinks = Suppliers.ofInstance(Boolean.TRUE.equals(https));
+        } else {
+            httpsForMcpLinks = new Supplier<Boolean>() {
+                @Override
+                public Boolean get() {
+                    try {
+                        return configRepository.getEmbeddedWebConfig().https();
+                    } catch (Exception e) {
+                        logger.debug(e.getMessage(), e);
+                        return false;
+                    }
+                }
+            };
+        }
+        McpServer mcpServer = new McpServer(central, offlineViewer, version, httpSessionManager,
+                httpsForMcpLinks, clock);
 
         CommonHandler commonHandler = new CommonHandler(central, layoutService, httpServices,
                 httpSessionManager, jsonServices, mcpServer, clock);
