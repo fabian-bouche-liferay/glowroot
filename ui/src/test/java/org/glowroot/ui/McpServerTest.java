@@ -474,7 +474,7 @@ public class McpServerTest {
         JsonNode body = capturePostBody("/backend/config/instrumentation/add");
         assertThat(body.path("captureKind").asText()).isEqualTo("transaction");
         assertThat(body.at("/methodParameterTypes/0").asText()).isEqualTo("..");
-        assertThat(body.path("timerName").asText()).isEqualTo("Job.run");
+        assertThat(body.path("timerName").asText()).isEqualTo("Job run");
         assertThat(body.path("traceEntryMessageTemplate").asText())
                 .isEqualTo("Job.{{methodName}}()");
         assertThat(body.path("transactionType").asText()).isEqualTo("Background");
@@ -507,6 +507,36 @@ public class McpServerTest {
         assertThat(body.path("traceEntryMessageTemplate").asText()).isEmpty();
         assertThat(body.path("transactionType").asText()).isEmpty();
         assertThat(body.path("alreadyInTransactionBehavior").isNull()).isTrue();
+    }
+
+    @Test
+    public void shouldDeriveValidTimerNameFromWildcardMethod() throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/instrumentation/add"),
+                anyMap(), anyString(), eq(user)))
+                        .thenReturn(ok("{\"config\":{\"version\":\"i3\"}}"));
+
+        embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Outer$Dao\","
+                        + "\"methodName\":\"find*\",\"captureKind\":\"timer\"}")),
+                commonHandler);
+
+        assertThat(capturePostBody("/backend/config/instrumentation/add").path("timerName")
+                .asText()).isEqualTo("Dao find");
+    }
+
+    @Test
+    public void shouldRejectInvalidTimerName() throws Exception {
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Dao\","
+                        + "\"methodName\":\"find\",\"captureKind\":\"timer\","
+                        + "\"timerName\":\"dao.find\"}")),
+                commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("letters, digits and spaces");
+        verify(commonHandler, never()).handleInternalPost(anyString(), anyMap(), anyString(),
+                any(Authentication.class));
     }
 
     @Test

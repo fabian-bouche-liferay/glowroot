@@ -99,7 +99,8 @@ clients can ask for confirmation. Changes are logged in the Glowroot audit log l
 
 `create_instrumentation` uses the same defaults as a new instrumentation in the UI (any parameter
 types, `capture-trace-entry` when already in a transaction, names derived from the class and
-method). Templates can use `{{0}}`, `{{1}}`... (arguments, e.g. `{{0.id}}`), `{{this}}`, `{{_}}`
+method; timer names may only contain letters, digits and spaces, the agent silently ignores
+instrumentation with an invalid timer name, so the tool rejects it). Templates can use `{{0}}`, `{{1}}`... (arguments, e.g. `{{0.id}}`), `{{this}}`, `{{_}}`
 (return value) and `{{methodName}}`. New instrumentation applies to classes loaded afterwards;
 `apply_instrumentation_changes` is needed for classes already loaded, and requires a JVM that
 supports class retransformation (the `-javaagent` agent does).

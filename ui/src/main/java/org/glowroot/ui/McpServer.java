@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -77,6 +78,9 @@ class McpServer {
             ImmutableList.of(LATEST_PROTOCOL_VERSION, "2025-03-26", "2024-11-05");
 
     private static final long DEFAULT_TIME_RANGE_MILLIS = MINUTES.toMillis(60);
+
+    // same rule as InstrumentationConfig.validationErrors() in the agent
+    private static final Pattern TIMER_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9 ]*");
 
     // json-rpc error codes
     private static final int PARSE_ERROR = -32700;
@@ -687,8 +691,8 @@ class McpServer {
                         .stringProperty("methodReturnType", "Return type (default any)", false)
                         .enumProperty("captureKind", "What to capture", "timer", "trace-entry",
                                 "transaction", "other")
-                        .stringProperty("timerName", "Timer name (default derived from the"
-                                + " method)", false)
+                        .stringProperty("timerName", "Timer name, letters, digits and spaces"
+                                + " only (default derived from the class and method)", false)
                         .stringProperty("traceEntryMessageTemplate", "Trace entry message"
                                 + " (trace-entry, transaction; default Class.method())", false)
                         .intProperty("traceEntryStackThresholdMillis", "Capture the stack"
@@ -996,8 +1000,19 @@ class McpServer {
         body.put("nestingGroup", args.string("nestingGroup", ""));
         body.put("order", args.integer("order", 0));
         body.put("captureKind", captureKind);
-        body.put("timerName", timer
-                ? args.string("timerName", simpleClassName + "." + methodName) : "");
+        String timerName = "";
+        if (timer) {
+            timerName = args.string("timerName", "");
+            if (timerName.isEmpty()) {
+                timerName = toTimerName(simpleClassName + " " + methodName);
+            } else if (!TIMER_NAME_PATTERN.matcher(timerName).matches()) {
+                // the agent silently ignores instrumentation configs with an invalid timer name
+                // (see InstrumentationConfig.validationErrors())
+                throw new ToolException("timerName can only contain letters, digits and spaces: "
+                        + timerName);
+            }
+        }
+        body.put("timerName", timerName);
         body.put("traceEntryMessageTemplate", traceEntry ? args.string(
                 "traceEntryMessageTemplate", simpleClassName + ".{{methodName}}()") : "");
         Long stackThresholdMillis = args.longValue("traceEntryStackThresholdMillis");
@@ -1037,6 +1052,11 @@ class McpServer {
         result.put("nextStep", "call apply_instrumentation_changes to apply it to already"
                 + " loaded classes");
         return mapper.writeValueAsString(result);
+    }
+
+    private static String toTimerName(String text) {
+        String timerName = text.replaceAll("[^a-zA-Z0-9 ]+", " ").replaceAll(" +", " ").trim();
+        return timerName.isEmpty() ? "custom" : timerName;
     }
 
     private static ObjectNode objectNode(String name, String value) {
