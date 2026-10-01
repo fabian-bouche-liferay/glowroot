@@ -352,11 +352,42 @@ class McpServer {
             text = "Unexpected error: " + e;
             isError = true;
         }
+        JsonNode structured = null;
+        if (!isError) {
+            structured = parseJson(text);
+            if (structured != null) {
+                McpResponses.normalizeNumbers(structured);
+                text = writeJson(structured, text);
+            }
+        }
         ObjectNode content = result.putArray("content").addObject();
         content.put("type", "text");
         content.put("text", text);
+        if (structured instanceof ObjectNode) {
+            // MCP 2025-06-18: same result, as json the client does not need to parse
+            result.set("structuredContent", structured);
+        }
         result.put("isError", isError);
         return result(id, result);
+    }
+
+    private static @Nullable JsonNode parseJson(String text) {
+        try {
+            return mapper.readTree(text);
+        } catch (Exception e) {
+            // not json (e.g. a plain message)
+            logger.debug(e.getMessage(), e);
+            return null;
+        }
+    }
+
+    private static String writeJson(JsonNode node, String fallback) {
+        try {
+            return mapper.writeValueAsString(node);
+        } catch (Exception e) {
+            logger.debug(e.getMessage(), e);
+            return fallback;
+        }
     }
 
     private @Nullable Tool getTool(String name) {
@@ -411,7 +442,8 @@ class McpServer {
                         "", backend.uiUrl("transaction/average", uiTransactionParams(args)))));
 
         list.add(new Tool("get_transaction_percentiles",
-                "Response time percentiles (in milliseconds) for a transaction type or name.",
+                "Response time percentiles for a transaction type or name (valueMillis and"
+                        + " valueNanos per percentile).",
                 schema().agentId().transactionType().transactionName().timeRange()
                         .numberArrayProperty("percentiles",
                                 "Percentiles to compute (default [50, 95, 99])")
@@ -424,11 +456,12 @@ class McpServer {
                         percentiles.add("95");
                         percentiles.add("99");
                     }
-                    return withUrl(stripChartSeries(args,
+                    JsonNode node = mapper.readTree(stripChartSeries(args,
                             backend.get("/backend/transaction/percentiles",
-                                    transactionParams(args).putAll("percentile", percentiles))),
-                            "", backend.uiUrl("transaction/percentiles",
-                                    uiTransactionParams(args)));
+                                    transactionParams(args).putAll("percentile", percentiles))));
+                    McpResponses.addPercentileMillis(node);
+                    return withUrl(mapper.writeValueAsString(node), "",
+                            backend.uiUrl("transaction/percentiles", uiTransactionParams(args)));
                 }));
 
         list.add(new Tool("get_transaction_throughput",
@@ -441,12 +474,17 @@ class McpServer {
                         "", backend.uiUrl("transaction/throughput", uiTransactionParams(args)))));
 
         list.add(new Tool("get_transaction_queries",
-                "Queries (SQL, CQL, ...) executed by a transaction type or name, sorted by total"
-                        + " time. Use get_full_query_text with fullQueryTextSha1 when the text"
-                        + " is truncated.",
-                schema().agentId().transactionType().transactionName().timeRange(),
-                (args, backend) -> withUrl(backend.get("/backend/transaction/queries",
-                        transactionParams(args)), "queries",
+                "Queries (SQL, CQL, ...) executed by a transaction name, or by all transactions"
+                        + " of a type when transactionName is omitted (the most expensive queries"
+                        + " of the application). Use get_full_query_text with fullQueryTextSha1"
+                        + " when the text is truncated.",
+                schema().agentId().transactionType().transactionName().timeRange()
+                        .enumProperty("sortBy", "Sort order (default total-time)", "total-time",
+                                "execution-count", "average-time", "total-rows")
+                        .intProperty("limit", "Max number of queries (default 50)"),
+                (args, backend) -> withUrl(sortAndLimitQueries(args,
+                        backend.get("/backend/transaction/queries", transactionParams(args))),
+                        "queries",
                         backend.uiUrl("transaction/queries", uiTransactionParams(args)))));
 
         list.add(new Tool("get_full_query_text",
@@ -466,6 +504,57 @@ class McpServer {
                         transactionParams(args)), "serviceCalls",
                         backend.uiUrl("transaction/service-calls", uiTransactionParams(args)))));
 
+        list.add(new Tool("get_transaction_profile",
+                "Aggregated thread profile (stack samples) of a transaction type or name,"
+                        + " summarized: sample count, hottest frames (inclusive and self, with"
+                        + " percent), the hot path down to its branch points, and leaf thread"
+                        + " states. Start here to find where the time goes before reading"
+                        + " queries.",
+                schema().agentId().transactionType().transactionName().timeRange()
+                        .booleanProperty("auxiliary", "Profile of the auxiliary (async) threads"
+                                + " instead of the main threads (default false)")
+                        .stringArrayProperty("include", "Only samples whose stack contains one"
+                                + " of these texts (optional)", false)
+                        .stringArrayProperty("exclude", "Drop samples whose stack contains one"
+                                + " of these texts (optional)", false)
+                        .profileSummaryOptions(),
+                (args, backend) -> {
+                    Params params = transactionParams(args)
+                            .put("auxiliary", args.bool("auxiliary", false))
+                            .put("truncate-branch-percentage", 0.1);
+                    // an empty include parameter filters out every sample
+                    List<String> include = args.stringList("include");
+                    if (!include.isEmpty()) {
+                        params.putAll("include", include);
+                    }
+                    List<String> exclude = args.stringList("exclude");
+                    if (!exclude.isEmpty()) {
+                        params.putAll("exclude", exclude);
+                    }
+                    JsonNode response = mapper.readTree(
+                            backend.get("/backend/transaction/profile", params));
+                    ObjectNode summary =
+                            (ObjectNode) mapper.readTree(summarizeProfile(args,
+                                    response.path("profile")));
+                    summary.put("hasMainThreadProfile",
+                            response.path("hasUnfilteredMainThreadProfile").asBoolean());
+                    summary.put("hasAuxThreadProfile",
+                            response.path("hasUnfilteredAuxThreadProfile").asBoolean());
+                    if (response.path("overwritten").asBoolean()) {
+                        summary.put("overwritten", true);
+                    }
+                    summary.put("glowrootUrl", backend.uiUrl("transaction/thread-profile",
+                            uiTransactionParams(args)));
+                    return mapper.writeValueAsString(summary);
+                }));
+
+        list.add(new Tool("get_error_summary",
+                "Errors of a transaction type (or name): error messages with their count, and,"
+                        + " for a whole type, the transaction names with the most errors.",
+                schema().agentId().transactionType().transactionName().timeRange()
+                        .intProperty("limit", "Max number of messages / names (default 20)"),
+                (args, backend) -> errorSummary(args, backend)));
+
         list.add(new Tool("list_traces",
                 "List captured traces (slow traces, or error traces when errorsOnly is true) for a"
                         + " transaction type or name. Returns traceId and agentId to use with"
@@ -482,17 +571,41 @@ class McpServer {
                         + " stats, entry/query/profile sample counts.",
                 schema().traceAgentId().traceId(),
                 (args, backend) -> {
-                    String header = backend.get("/backend/trace/header", traceParams(args));
+                    String header = checkTraceFound(
+                            backend.get("/backend/trace/header", traceParams(args)));
                     return withUrl(header, "", traceUrl(args, backend, header));
                 }));
 
         list.add(new Tool("get_trace_entries",
-                "Trace entries (timeline of instrumented calls) of a trace. Query entries carry an"
-                        + " abbreviated queryText, use get_trace_queries for the full text.",
-                schema().traceAgentId().traceId(),
-                (args, backend) -> withUrl(inlineSharedQueryTexts(
-                        backend.get("/backend/trace/entries", traceParams(args)), true),
-                        "", traceUrl(args, backend))));
+                "Trace entries (timeline of instrumented calls) of a trace, flattened in order"
+                        + " with their depth, filtered and paged (a trace can hold thousands of"
+                        + " entries): use minDurationMillis / kind / messageContains and"
+                        + " offset+limit, or aggregate=true for counts and total time per query"
+                        + " text or message. Query entries carry an abbreviated queryText, use"
+                        + " get_trace_queries for the full text.",
+                schema().traceAgentId().traceId()
+                        .numberProperty("minDurationMillis",
+                                "Only entries at least this long (default 0)")
+                        .enumProperty("kind", "Entry kind (default all)", "all", "query",
+                                "other")
+                        .stringProperty("messageContains",
+                                "Only entries whose message or query contains this text", false)
+                        .booleanProperty("aggregate", "Group matching entries by query text or"
+                                + " message instead of listing them (default false)")
+                        .intProperty("offset", "Index of the first matching entry (default 0)")
+                        .intProperty("limit", "Max entries (or groups) returned (default 100)"),
+                (args, backend) -> {
+                    JsonNode entries = mapper.readTree(inlineSharedQueryTexts(checkTraceFound(
+                            backend.get("/backend/trace/entries", traceParams(args))), true));
+                    Double minDurationMillis = args.number("minDurationMillis");
+                    ObjectNode page = McpResponses.pageEntries(entries,
+                            minDurationMillis == null ? 0 : minDurationMillis,
+                            args.string("kind", "all"), args.string("messageContains", ""),
+                            args.bool("aggregate", false), args.integer("offset", 0),
+                            args.integer("limit", 100));
+                    return withUrl(mapper.writeValueAsString(page), "",
+                            traceUrl(args, backend));
+                }));
 
         list.add(new Tool("get_trace_queries",
                 "Queries executed during a trace, aggregated by query text and sorted by total"
@@ -500,8 +613,36 @@ class McpServer {
                         + " truncated the text, use get_full_query_text with fullQueryTextSha1.",
                 schema().traceAgentId().traceId(),
                 (args, backend) -> withUrl(sortQueriesByTotalTime(inlineSharedQueryTexts(
-                        backend.get("/backend/trace/queries", traceParams(args)), false)),
+                        checkTraceFound(backend.get("/backend/trace/queries",
+                                traceParams(args))), false)),
                         "", traceUrl(args, backend))));
+
+        list.add(new Tool("get_trace_profile",
+                "Thread profile (stack samples) of a trace, summarized: sample count, hottest"
+                        + " frames (inclusive and self, with percent), the hot path down to its"
+                        + " branch points, and leaf thread states (RUNNABLE, WAITING, BLOCKED).",
+                schema().traceAgentId().traceId()
+                        .booleanProperty("auxiliary", "Profile of the auxiliary (async) threads"
+                                + " instead of the main thread (default false)")
+                        .profileSummaryOptions(),
+                (args, backend) -> {
+                    String path = args.bool("auxiliary", false)
+                            ? "/backend/trace/aux-thread-profile"
+                            : "/backend/trace/main-thread-profile";
+                    String profile;
+                    try {
+                        profile = backend.get(path, traceParams(args));
+                    } catch (ToolException e) {
+                        if (e.getMessage().startsWith("Not found")) {
+                            throw new ToolException("No profile samples for this trace (unknown"
+                                    + " traceId, or the trace was shorter than the profiling"
+                                    + " interval, see get_transaction_config)");
+                        }
+                        throw e;
+                    }
+                    return withUrl(summarizeProfile(args, mapper.readTree(profile)), "",
+                            traceUrl(args, backend));
+                }));
 
         // ---- jvm gauges ----
 
@@ -522,17 +663,80 @@ class McpServer {
                         + " [captureTime, value] points (null marks a gap).",
                 schema().agentId().timeRange()
                         .stringArrayProperty("gaugeNames",
-                                "Gauge names as returned by list_gauges (field name)", true),
+                                "Gauge names as returned by list_gauges (field name)", true)
+                        .stringProperty("aroundTraceId", "Use the time range of this trace"
+                                + " (plus windowMinutes on each side) instead of from/to, to"
+                                + " correlate a slow trace with CPU, pools, threads...", false)
+                        .intProperty("windowMinutes",
+                                "Minutes around the trace (default 5, with aroundTraceId)"),
                 (args, backend) -> {
                     List<String> gaugeNames = args.stringList("gaugeNames");
                     if (gaugeNames.isEmpty()) {
                         throw new ToolException("gaugeNames is required");
                     }
-                    ObjectNode node = (ObjectNode) mapper.readTree(backend.get(
-                            "/backend/jvm/gauges",
-                            timeRangeParams(args).putAll("gauge-name", gaugeNames)));
+                    long[] range = gaugeTimeRange(args, backend);
+                    Params params = agentRollupParams(args).put("from", range[0])
+                            .put("to", range[1]).putAll("gauge-name", gaugeNames);
+                    ObjectNode node = (ObjectNode) mapper.readTree(
+                            backend.get("/backend/jvm/gauges", params));
                     node.remove("allGauges");
-                    node.put("glowrootUrl", gaugesUiUrl(args, backend, gaugeNames));
+                    node.put("from", range[0]);
+                    node.put("to", range[1]);
+                    node.put("glowrootUrl", backend.uiUrl("jvm/gauges",
+                            uiAgentParams(agentId(args)).putAll("gauge-name", gaugeNames)
+                                    .put("from", range[0]).put("to", range[1])));
+                    return mapper.writeValueAsString(node);
+                }));
+
+        list.add(new Tool("read_mbean_values",
+                "Current attribute values of an MBean, read once from the running JVM (no gauge"
+                        + " is created). The agent must be connected.",
+                schema().agentId()
+                        .stringProperty("objectName", "Exact MBean object name, e.g."
+                                + " com.zaxxer.hikari:type=Pool (HikariPool-1)", true),
+                (args, backend) -> withUrl(backend.get("/backend/jvm/mbean-attribute-map",
+                        agentIdParams(args).put("object-name",
+                                args.requiredString("objectName"))),
+                        "", null)));
+
+        // ---- jvm: threads, memory ----
+
+        list.add(new Tool("get_thread_dump",
+                "Thread dump of the running JVM: threads currently running a transaction (with"
+                        + " their trace id and stack), deadlocks, and the other threads grouped by"
+                        + " state and stack (includeOtherThreads). The agent must be connected.",
+                schema().agentId()
+                        .intProperty("maxStackDepth", "Max stack frames per thread (default 40)")
+                        .booleanProperty("includeOtherThreads", "Include the groups of threads"
+                                + " not running a transaction (default false, only their states"
+                                + " are counted)"),
+                (args, backend) -> withUrl(mapper.writeValueAsString(
+                        McpResponses.compactThreadDump(
+                                mapper.readTree(backend.get("/backend/jvm/thread-dump",
+                                        agentIdParams(args))),
+                                args.integer("maxStackDepth", 40),
+                                args.bool("includeOtherThreads", false))),
+                        "", backend.uiUrl("jvm/thread-dump", uiAgentParams(agentId(args))))));
+
+        list.add(Tool.write("get_heap_histogram",
+                "Heap histogram of the running JVM (classes using the most memory), much cheaper"
+                        + " than a heap dump, but it briefly pauses the JVM.",
+                schema().agentId().intProperty("limit", "Max number of classes (default 30)"),
+                (args, backend) -> {
+                    ObjectNode node = (ObjectNode) mapper.readTree(backend.post(
+                            "/backend/jvm/heap-histogram", agentIdParams(args),
+                            mapper.createObjectNode()));
+                    JsonNode itemsNode = node.path("items");
+                    int limit = args.integer("limit", 30);
+                    if (itemsNode instanceof ArrayNode) {
+                        ArrayNode items = (ArrayNode) itemsNode;
+                        node.put("classCount", items.size());
+                        while (items.size() > limit) {
+                            items.remove(items.size() - 1);
+                        }
+                    }
+                    node.put("glowrootUrl", backend.uiUrl("jvm/heap-histogram",
+                            uiAgentParams(agentId(args))));
                     return mapper.writeValueAsString(node);
                 }));
 
@@ -563,6 +767,14 @@ class McpServer {
                         .booleanProperty("removeOverride",
                                 "Remove the matching override instead of setting it"),
                 (args, backend) -> setSlowTraceThreshold(args, backend)));
+
+        list.add(new Tool("list_plugins",
+                "Instrumentation plugins of the agent (servlet, jdbc, ... and custom plugins"
+                        + " such as a FreeMarker plugin), with their configuration properties.",
+                schema().agentId(),
+                (args, backend) -> withUrl(backend.get("/backend/config/plugins",
+                        agentIdParams(args)), "plugins",
+                        backend.uiUrl("config/plugin-list", uiAgentParams(agentId(args))))));
 
         // ---- configuration: gauges ----
 
@@ -712,7 +924,10 @@ class McpServer {
                         .stringProperty("nestingGroup", "Nesting group (optional, prevents"
                                 + " nested captures of the same group)", false)
                         .intProperty("order", "Order relative to other instrumentation"
-                                + " (default 0)"),
+                                + " (default 0)")
+                        .booleanProperty("dryRun", "Only validate (class and method found in"
+                                + " the JVM, signature, templates) and return the config that"
+                                + " would be created (default false)"),
                 (args, backend) -> createInstrumentation(args, backend)));
 
         list.add(Tool.delete("delete_instrumentation",
@@ -738,18 +953,131 @@ class McpServer {
                                     uiAgentParams(agentId(args))));
                 }));
 
-        list.add(Tool.write("apply_instrumentation_changes",
+        list.add(Tool.delete("apply_instrumentation_changes",
                 "Apply the instrumentation configuration to the classes already loaded in the"
                         + " monitored JVM (re-weaving them), so that created, changed or deleted"
-                        + " instrumentation takes effect without restarting the JVM. Returns the"
-                        + " number of re-woven classes.",
+                        + " instrumentation takes effect without restarting the JVM. Re-weaving"
+                        + " retransforms classes and can pause the JVM: ask the user first."
+                        + " Returns the number of re-woven classes and the duration.",
                 schema().agentId(),
-                (args, backend) -> withUrl(backend.post("/backend/config/reweave",
-                        agentIdParams(args), mapper.createObjectNode()), "",
-                        backend.uiUrl("config/instrumentation-list",
-                                uiAgentParams(agentId(args))))));
+                (args, backend) -> {
+                    long startNanos = System.nanoTime();
+                    ObjectNode node = (ObjectNode) mapper.readTree(backend.post(
+                            "/backend/config/reweave", agentIdParams(args),
+                            mapper.createObjectNode()));
+                    node.put("durationMillis",
+                            McpResponses.millis(System.nanoTime() - startNanos));
+                    node.put("glowrootUrl", backend.uiUrl("config/instrumentation-list",
+                            uiAgentParams(agentId(args))));
+                    return mapper.writeValueAsString(node);
+                }));
 
         return ImmutableList.copyOf(list);
+    }
+
+    // ---- response helpers for the newer tools ----
+
+    // the trace services answer {"expired":true} both for an expired and for an unknown trace id
+    private static String checkTraceFound(String json) throws Exception {
+        JsonNode node = mapper.readTree(json);
+        if (node != null && node.size() == 1 && node.path("expired").asBoolean()) {
+            throw new ToolException("Trace not found: unknown traceId, or the trace has expired"
+                    + " (see the trace retention under Configuration > Storage)");
+        }
+        return json;
+    }
+
+    private static String sortAndLimitQueries(Args args, String json) throws Exception {
+        JsonNode node = mapper.readTree(json);
+        if (!(node instanceof ArrayNode)) {
+            // e.g. {"overwritten":true}
+            return json;
+        }
+        String sortBy = args.string("sortBy", "total-time");
+        List<JsonNode> queries = Lists.newArrayList(node);
+        Collections.sort(queries, (left, right) -> Double.compare(querySortValue(right, sortBy),
+                querySortValue(left, sortBy)));
+        int limit = args.integer("limit", 50);
+        ObjectNode result = mapper.createObjectNode();
+        result.put("queryCount", queries.size());
+        ArrayNode queriesNode = result.putArray("queries");
+        for (JsonNode query : queries.subList(0, Math.min(limit, queries.size()))) {
+            queriesNode.add(query);
+        }
+        return mapper.writeValueAsString(result);
+    }
+
+    private static double querySortValue(JsonNode query, String sortBy) {
+        double executionCount = query.path("executionCount").asDouble();
+        switch (sortBy) {
+            case "execution-count":
+                return executionCount;
+            case "average-time":
+                return executionCount == 0 ? 0
+                        : query.path("totalDurationNanos").asDouble() / executionCount;
+            case "total-rows":
+                return query.path("totalRows").asDouble();
+            default:
+                return query.path("totalDurationNanos").asDouble();
+        }
+    }
+
+    private static final ImmutableList<String> DEFAULT_COLLAPSED_FRAME_PREFIXES =
+            ImmutableList.of("java.lang.Thread.", "java.util.concurrent.", "org.apache.catalina.",
+                    "org.apache.coyote.", "org.apache.tomcat.", "javax.servlet.",
+                    "jakarta.servlet.", "org.glowroot.", "sun.reflect.", "jdk.internal.reflect.",
+                    "java.lang.reflect.");
+
+    private static String summarizeProfile(Args args, JsonNode profile) throws Exception {
+        if (args.bool("raw", false)) {
+            return mapper.writeValueAsString(profile);
+        }
+        List<String> collapsed = args.stringList("collapseFramePrefixes");
+        if (!args.has("collapseFramePrefixes")) {
+            collapsed.addAll(DEFAULT_COLLAPSED_FRAME_PREFIXES);
+            // servlet filter chains (any framework), e.g. the portal filters
+            collapsed.add("*doFilter");
+        }
+        Double hotPathMinPercent = args.number("hotPathMinPercent");
+        return mapper.writeValueAsString(McpResponses.summarizeProfile(profile,
+                args.integer("topFrames", 15), hotPathMinPercent == null ? 5 : hotPathMinPercent,
+                collapsed));
+    }
+
+    // from/to, or the time range of a trace plus a window on each side
+    private long[] gaugeTimeRange(Args args, Backend backend) throws Exception {
+        String traceId = args.string("aroundTraceId", "");
+        if (traceId.isEmpty()) {
+            return new long[] {args.from(), args.to()};
+        }
+        String agentId = requireAgentId(args, "the agent that captured the trace");
+        JsonNode header = mapper.readTree(checkTraceFound(backend.get("/backend/trace/header",
+                new Params().put("agent-id", agentId).put("trace-id", traceId)
+                        .put("check-live-traces", true))));
+        long window = MINUTES.toMillis(args.integer("windowMinutes", 5));
+        long captureTime = header.path("captureTime").asLong();
+        long startTime = header.path("startTime").asLong(captureTime);
+        return new long[] {startTime - window, captureTime + window};
+    }
+
+    private String errorSummary(Args args, Backend backend) throws Exception {
+        int limit = args.integer("limit", 20);
+        ObjectNode result = (ObjectNode) mapper.readTree(backend.get("/backend/error/messages",
+                transactionParams(args).put("error-message-limit", limit)));
+        result.remove("dataSeries");
+        result.remove("dataSeriesExtra");
+        result.remove("dataPointIntervalMillis");
+        if (args.string("transactionName", "").isEmpty()) {
+            JsonNode summaries = mapper.readTree(backend.get("/backend/error/summaries",
+                    timeRangeParams(args)
+                            .put("transaction-type", args.requiredString("transactionType"))
+                            .put("sort-order", "error-count")
+                            .put("limit", limit)));
+            result.set("overall", summaries.path("overall"));
+            result.set("transactions", summaries.path("transactions"));
+        }
+        result.put("glowrootUrl", backend.uiUrl("error/messages", uiTransactionParams(args)));
+        return mapper.writeValueAsString(result);
     }
 
     // ---- trace and gauge links ----
@@ -922,17 +1250,48 @@ class McpServer {
             // same naming as GaugeCollector
             gaugeNames.add(mbeanObjectName + ":" + attribute + (counter ? "[counter]" : ""));
         }
-        String response;
-        try {
-            response = backend.post("/backend/config/gauges/add", agentIdParams(args), body);
-        } catch (ToolException e) {
-            if (e.getMessage().startsWith("409")) {
-                throw new ToolException("A gauge already exists for this MBean object name (use"
-                        + " list_gauge_configs)");
+        List<String> warnings = validateGauge(args, backend, mbeanObjectName, attributes);
+        JsonNode existing = findGaugeConfig(args, backend, mbeanObjectName);
+        ObjectNode result;
+        if (existing == null) {
+            result = (ObjectNode) mapper.readTree(
+                    backend.post("/backend/config/gauges/add", agentIdParams(args), body));
+            result.put("created", true);
+        } else {
+            // idempotent: add the missing attributes to the existing gauge (if any)
+            ArrayNode merged = mapper.createArrayNode();
+            List<String> existingNames = Lists.newArrayList();
+            for (JsonNode attribute : existing.path("mbeanAttributes")) {
+                merged.add(attribute);
+                existingNames.add(attribute.path("name").asText());
             }
-            throw e;
+            ArrayNode added = mapper.createArrayNode();
+            for (JsonNode attribute : mbeanAttributes) {
+                if (!existingNames.contains(attribute.path("name").asText())) {
+                    merged.add(attribute);
+                    added.add(attribute.path("name").asText());
+                }
+            }
+            if (added.size() == 0) {
+                result = mapper.createObjectNode();
+                result.set("config", existing);
+                result.put("unchanged", true);
+                warnings.add("a gauge already exists for this MBean with these attributes");
+            } else {
+                body.set("mbeanAttributes", merged);
+                body.put("version", existing.path("version").asText());
+                result = (ObjectNode) mapper.readTree(backend.post(
+                        "/backend/config/gauges/update", agentIdParams(args), body));
+                result.put("updated", true);
+                result.set("addedAttributes", added);
+            }
         }
-        ObjectNode result = (ObjectNode) mapper.readTree(response);
+        if (!warnings.isEmpty()) {
+            ArrayNode warningsNode = result.putArray("warnings");
+            for (String warning : warnings) {
+                warningsNode.add(warning);
+            }
+        }
         String agentId = agentId(args);
         result.put("glowrootUrl", backend.uiUrl("config/gauge",
                 uiAgentParams(agentId).put("v", result.at("/config/version").asText())));
@@ -945,6 +1304,58 @@ class McpServer {
             result.put("gaugeValuesUrl", gaugesUiUrl(args, backend, gaugeNames));
         }
         return mapper.writeValueAsString(result);
+    }
+
+    private List<String> validateGauge(Args args, Backend backend, String mbeanObjectName,
+            List<String> attributes) throws Exception {
+        List<String> warnings = Lists.newArrayList();
+        boolean pattern = mbeanObjectName.indexOf('*') != -1 || mbeanObjectName.indexOf('?') != -1;
+        if (pattern) {
+            warnings.add("object name pattern: one series is captured per matching MBean and"
+                    + " attribute, check how many MBeans match with search_mbeans");
+        }
+        JsonNode meta;
+        try {
+            meta = mapper.readTree(backend.get("/backend/config/mbean-attributes",
+                    agentIdParams(args).put("object-name", mbeanObjectName)));
+        } catch (ToolException e) {
+            warnings.add("could not validate against the JVM: " + e.getMessage());
+            return warnings;
+        }
+        if (meta.path("noMatchFoundForNonPattern").asBoolean()
+                || meta.path("noMatchFoundForPattern").asBoolean()) {
+            throw new ToolException("No MBean matches " + mbeanObjectName + " (use search_mbeans)");
+        }
+        List<String> available = Lists.newArrayList();
+        for (JsonNode attribute : meta.path("mbeanAttributes")) {
+            available.add(attribute.asText());
+        }
+        if (!available.isEmpty()) {
+            List<String> unknown = Lists.newArrayList();
+            for (String attribute : attributes) {
+                if (!available.contains(attribute)) {
+                    unknown.add(attribute);
+                }
+            }
+            if (!unknown.isEmpty()) {
+                throw new ToolException("Unknown attributes " + unknown + " for "
+                        + mbeanObjectName + ", available: "
+                        + available.subList(0, Math.min(40, available.size())));
+            }
+        }
+        return warnings;
+    }
+
+    private @Nullable JsonNode findGaugeConfig(Args args, Backend backend,
+            String mbeanObjectName) throws Exception {
+        for (JsonNode response : mapper.readTree(
+                backend.get("/backend/config/gauges", agentIdParams(args)))) {
+            JsonNode config = response.path("config");
+            if (config.path("mbeanObjectName").asText().equals(mbeanObjectName)) {
+                return config;
+            }
+        }
+        return null;
     }
 
     private String listInstrumentations(Args args, Backend backend) throws Exception {
@@ -1045,13 +1456,78 @@ class McpServer {
         body.put("transactionOuter", false);
         body.put("enabledProperty", "");
         body.put("traceEntryEnabledProperty", "");
+        ArrayNode warnings = mapper.createArrayNode();
+        JsonNode signatures =
+                validateInstrumentationTarget(args, backend, className, methodName, warnings);
+        if (args.bool("dryRun", false)) {
+            ObjectNode result = mapper.createObjectNode();
+            result.put("dryRun", true);
+            result.set("config", body);
+            result.set("methodSignatures", signatures);
+            result.set("warnings", warnings);
+            return mapper.writeValueAsString(result);
+        }
         ObjectNode result = (ObjectNode) mapper.readTree(backend.post(
                 "/backend/config/instrumentation/add", agentIdParams(args), body));
+        if (warnings.size() > 0) {
+            result.set("warnings", warnings);
+        }
         result.put("glowrootUrl", backend.uiUrl("config/instrumentation",
                 uiAgentParams(agentId(args)).put("v", result.at("/config/version").asText())));
         result.put("nextStep", "call apply_instrumentation_changes to apply it to already"
                 + " loaded classes");
         return mapper.writeValueAsString(result);
+    }
+
+    // checks that the class and method exist in the monitored JVM, returns the method signatures
+    private JsonNode validateInstrumentationTarget(Args args, Backend backend, String className,
+            String methodName, ArrayNode warnings) throws Exception {
+        try {
+            boolean classFound = false;
+            for (JsonNode name : mapper.readTree(backend.get(
+                    "/backend/config/matching-class-names", agentIdParams(args)
+                            .put("partial-class-name", className).put("limit", 100)))) {
+                if (name.asText().equals(className)) {
+                    classFound = true;
+                }
+            }
+            if (!classFound) {
+                warnings.add("class " + className + " was not found in the JVM (wrong name, or"
+                        + " not loaded yet)");
+                return mapper.createArrayNode();
+            }
+            if (methodName.indexOf('*') != -1) {
+                return mapper.createArrayNode();
+            }
+            JsonNode signatures = mapper.readTree(backend.get("/backend/config/method-signatures",
+                    agentIdParams(args).put("class-name", className)
+                            .put("method-name", methodName)));
+            if (signatures.size() == 0) {
+                warnings.add("method " + methodName + " was not found in " + className);
+                return signatures;
+            }
+            List<String> parameterTypes = args.stringList("methodParameterTypes");
+            if (!parameterTypes.isEmpty() && !parameterTypes.equals(ImmutableList.of(".."))) {
+                boolean found = false;
+                for (JsonNode signature : signatures) {
+                    List<String> types = Lists.newArrayList();
+                    for (JsonNode type : signature.path("parameterTypes")) {
+                        types.add(type.asText());
+                    }
+                    if (types.equals(parameterTypes)) {
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    warnings.add("no overload of " + methodName + " takes " + parameterTypes
+                            + ", see methodSignatures");
+                }
+            }
+            return signatures;
+        } catch (ToolException e) {
+            warnings.add("could not validate against the JVM: " + e.getMessage());
+            return mapper.createArrayNode();
+        }
     }
 
     private static String toTimerName(String text) {
@@ -1484,6 +1960,10 @@ class McpServer {
             return to == null ? clock.currentTimeMillis() : to;
         }
 
+        private boolean has(String name) {
+            return node.has(name);
+        }
+
         private String requiredString(String name) throws ToolException {
             String value = string(name, "");
             if (value.isEmpty()) {
@@ -1602,6 +2082,17 @@ class McpServer {
                     + " (default: 60 minutes before to)");
             return numberProperty("to", "End of the time range, epoch milliseconds"
                     + " (default: now)");
+        }
+
+        private SchemaBuilder profileSummaryOptions() {
+            intProperty("topFrames", "Number of hottest frames listed (default 15)");
+            numberProperty("hotPathMinPercent", "Stop the hot path below this share of the"
+                    + " samples (default 5)");
+            stringArrayProperty("collapseFramePrefixes", "Frames hidden from the hot path"
+                    + " unless they branch (default: servlet container, filters and glowroot"
+                    + " frames; [] to show everything)", false);
+            return booleanProperty("raw", "Return the full profile tree instead of the summary"
+                    + " (large, default false)");
         }
 
         private SchemaBuilder includeChartSeries() {

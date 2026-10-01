@@ -67,6 +67,10 @@ public class McpServerTest {
         when(httpSessionManager.authenticateBasic("alice", "secret")).thenReturn(user);
         when(httpSessionManager.getAnonymousAuthentication())
                 .thenReturn(authentication("anonymous", true, ImmutableSet.<String>of()));
+        // default for the lookups the write tools make before writing (validation, existing
+        // configs), individual tests stub the endpoints they assert on
+        when(commonHandler.handleInternalGet(anyString(), anyMap(), any(Authentication.class)))
+                .thenReturn(ok("[]"));
     }
 
     @Test
@@ -368,7 +372,9 @@ public class McpServerTest {
 
         JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
         assertThat(text.has("sharedQueryTexts")).isFalse();
-        JsonNode queryMessage = text.at("/entries/0/childEntries/0/queryMessage");
+        assertThat(text.path("totalEntries").asInt()).isEqualTo(2);
+        assertThat(text.at("/entries/1/depth").asInt()).isEqualTo(1);
+        JsonNode queryMessage = text.at("/entries/1/queryMessage");
         assertThat(queryMessage.has("sharedQueryTextIndex")).isFalse();
         assertThat(queryMessage.path("prefix").asText()).isEqualTo("jdbc: ");
         String queryText = queryMessage.path("queryText").asText();
@@ -600,6 +606,134 @@ public class McpServerTest {
                 "https://apm.example.com/o/glowroot/transaction/traces?agent-id=node%201"
                         + "&transaction-type=Web&transaction-name=%2Fhome&from=1800000"
                         + "&to=5401000&modal-agent-id=node%201&modal-trace-id=abc");
+    }
+
+    @Test
+    public void shouldReportUnknownTraceAsToolError() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/trace/header"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"expired\":true}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_trace", "{\"traceId\":\"nope\"}")), commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("Trace not found");
+    }
+
+    @Test
+    public void shouldReturnStructuredContentWithIntegerDurations() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/transaction/summaries"), anyMap(),
+                eq(user))).thenReturn(ok("{\"overall\":{\"totalDurationNanos\":2.85202499E10}}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_transaction_summaries", "{\"transactionType\":\"Web\"}")),
+                commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.at("/structuredContent/overall/totalDurationNanos").isIntegralNumber())
+                .isTrue();
+        assertThat(result.at("/content/0/text").asText())
+                .contains("\"totalDurationNanos\":28520249900");
+    }
+
+    @Test
+    public void shouldSortAndLimitTransactionQueries() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/transaction/queries"), anyMap(),
+                eq(user))).thenReturn(ok("[{\"truncatedQueryText\":\"a\","
+                        + "\"totalDurationNanos\":10,\"executionCount\":1},"
+                        + "{\"truncatedQueryText\":\"b\",\"totalDurationNanos\":5,"
+                        + "\"executionCount\":312},{\"truncatedQueryText\":\"c\","
+                        + "\"totalDurationNanos\":1,\"executionCount\":2}]"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_transaction_queries", "{\"transactionType\":\"Web\","
+                        + "\"sortBy\":\"execution-count\",\"limit\":2}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("queryCount").asInt()).isEqualTo(3);
+        assertThat(text.path("queries").size()).isEqualTo(2);
+        assertThat(text.at("/queries/0/truncatedQueryText").asText()).isEqualTo("b");
+    }
+
+    @Test
+    public void shouldAddMissingAttributesToExistingGauge() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/gauges"), anyMap(), eq(user)))
+                .thenReturn(ok("[{\"config\":{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"mbeanAttributes\":[{\"name\":\"Active\",\"counter\":false}],"
+                        + "\"version\":\"g1\"}}]"));
+        when(commonHandler.handleInternalPost(eq("/backend/config/gauges/update"), anyMap(),
+                anyString(), eq(user))).thenReturn(ok("{\"config\":{\"version\":\"g2\"}}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_gauge", "{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"attributes\":[\"Active\",\"Idle\"]}")),
+                commonHandler);
+
+        JsonNode body = capturePostBody("/backend/config/gauges/update");
+        assertThat(body.path("version").asText()).isEqualTo("g1");
+        assertThat(body.path("mbeanAttributes").size()).isEqualTo(2);
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("updated").asBoolean()).isTrue();
+        assertThat(text.at("/addedAttributes/0").asText()).isEqualTo("Idle");
+    }
+
+    @Test
+    public void shouldNotDuplicateExistingGauge() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/gauges"), anyMap(), eq(user)))
+                .thenReturn(ok("[{\"config\":{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"mbeanAttributes\":[{\"name\":\"Active\",\"counter\":false}],"
+                        + "\"version\":\"g1\"}}]"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_gauge", "{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"attributes\":[\"Active\"]}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("unchanged").asBoolean()).isTrue();
+        verify(commonHandler, never()).handleInternalPost(anyString(), anyMap(), anyString(),
+                any(Authentication.class));
+    }
+
+    @Test
+    public void shouldRejectUnknownGaugeAttribute() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/mbean-attributes"), anyMap(),
+                eq(user))).thenReturn(ok("{\"mbeanAttributes\":[\"Active\",\"Idle\"]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_gauge", "{\"mbeanObjectName\":\"app:type=Pool\","
+                        + "\"attributes\":[\"Busy\"]}")),
+                commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("Unknown attributes [Busy]")
+                .contains("Idle");
+    }
+
+    @Test
+    public void shouldDryRunInstrumentationWithWarnings() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/matching-class-names"),
+                anyMap(), eq(user))).thenReturn(ok("[\"com.acme.Dao\"]"));
+        when(commonHandler.handleInternalGet(eq("/backend/config/method-signatures"), anyMap(),
+                eq(user))).thenReturn(ok("[{\"name\":\"find\",\"parameterTypes\":[\"long\"],"
+                        + "\"returnType\":\"void\",\"modifiers\":[]}]"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Dao\","
+                        + "\"methodName\":\"find\",\"captureKind\":\"timer\","
+                        + "\"methodParameterTypes\":[\"java.lang.String\"],\"dryRun\":true}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("dryRun").asBoolean()).isTrue();
+        assertThat(text.at("/config/timerName").asText()).isEqualTo("Dao find");
+        assertThat(text.at("/methodSignatures/0/parameterTypes/0").asText()).isEqualTo("long");
+        assertThat(text.at("/warnings/0").asText()).contains("no overload");
+        verify(commonHandler, never()).handleInternalPost(anyString(), anyMap(), anyString(),
+                any(Authentication.class));
     }
 
     @Test
