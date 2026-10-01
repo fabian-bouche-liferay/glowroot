@@ -34,6 +34,7 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.io.CharStreams;
 import com.google.common.io.Resources;
 import com.google.common.net.MediaType;
@@ -115,15 +116,17 @@ public class CommonHandler {
     private final ImmutableMap<Pattern, HttpService> httpServices;
     private final ImmutableList<JsonServiceMapping> jsonServiceMappings;
     private final HttpSessionManager httpSessionManager;
+    private final McpServer mcpServer;
     private final Clock clock;
 
     CommonHandler(boolean central, LayoutService layoutService,
             Map<Pattern, HttpService> httpServices, HttpSessionManager httpSessionManager,
-            List<Object> jsonServices, Clock clock) {
+            List<Object> jsonServices, McpServer mcpServer, Clock clock) {
         this.central = central;
         this.layoutService = layoutService;
         this.httpServices = ImmutableMap.copyOf(httpServices);
         this.httpSessionManager = httpSessionManager;
+        this.mcpServer = mcpServer;
         this.clock = clock;
         List<JsonServiceMapping> jsonServiceMappings = Lists.newArrayList();
         for (Object jsonService : jsonServices) {
@@ -145,6 +148,10 @@ public class CommonHandler {
 
     public CommonResponse handle(CommonRequest request) throws Exception {
         logger.debug("handleRequest(): path={}", request.getPath());
+        if (request.getPath().equals(McpServer.PATH)) {
+            // mcp clients authenticate using http basic authentication (not session cookie)
+            return mcpServer.handle(request, this);
+        }
         CommonResponse response = handleIfLoginOrLogoutRequest(request);
         if (response != null) {
             return response;
@@ -235,6 +242,13 @@ public class CommonHandler {
             return handleJsonServiceMappings(request, jsonServiceMapping, authentication);
         }
         return handleStaticResource(path, request);
+    }
+
+    // used by the mcp server to dispatch read-only tool calls to the same http/json services (and
+    // permission checks) that back the UI
+    CommonResponse handleInternalGet(String path, Map<String, List<String>> parameters,
+            Authentication authentication) throws Exception {
+        return handleRequest(new InternalGetRequest(path, parameters), authentication);
     }
 
     private @Nullable HttpService getHttpService(String path) {
@@ -589,6 +603,62 @@ public class CommonHandler {
     private static boolean isAutoRefresh(@Nullable List<String> autoRefreshParams) {
         return autoRefreshParams != null && autoRefreshParams.size() == 1
                 && Boolean.valueOf(autoRefreshParams.get(0));
+    }
+
+    private static class InternalGetRequest implements CommonRequest {
+
+        private final String path;
+        private final Map<String, List<String>> parameters;
+
+        private InternalGetRequest(String path, Map<String, List<String>> parameters) {
+            this.path = path;
+            // needs to be mutable since json service binding removes the bound parameters
+            this.parameters = Maps.newHashMap();
+            for (Map.Entry<String, List<String>> entry : parameters.entrySet()) {
+                this.parameters.put(entry.getKey(), Lists.newArrayList(entry.getValue()));
+            }
+        }
+
+        @Override
+        public String getMethod() {
+            return "GET";
+        }
+
+        @Override
+        public String getUri() {
+            return path;
+        }
+
+        @Override
+        public String getContextPath() {
+            return "";
+        }
+
+        @Override
+        public String getPath() {
+            return path;
+        }
+
+        @Override
+        public @Nullable String getHeader(CharSequence name) {
+            return null;
+        }
+
+        @Override
+        public Map<String, List<String>> getParameters() {
+            return parameters;
+        }
+
+        @Override
+        public List<String> getParameters(String name) {
+            List<String> values = parameters.get(name);
+            return values == null ? ImmutableList.<String>of() : values;
+        }
+
+        @Override
+        public String getContent() {
+            return "";
+        }
     }
 
     @Value.Immutable

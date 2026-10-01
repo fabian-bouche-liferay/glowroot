@@ -224,8 +224,11 @@ public class UiModule {
             httpServices.put(Pattern.compile("^/synthetic-monitors$"), indexHtmlHttpService);
         }
 
+        McpServer mcpServer =
+                new McpServer(central, offlineViewer, version, httpSessionManager, clock);
+
         CommonHandler commonHandler = new CommonHandler(central, layoutService, httpServices,
-                httpSessionManager, jsonServices, clock);
+                httpSessionManager, jsonServices, mcpServer, clock);
 
         if (servlet) {
             return new UiModule(commonHandler, reportingExecutor);

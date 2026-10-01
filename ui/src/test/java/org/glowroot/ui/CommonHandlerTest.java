@@ -42,7 +42,8 @@ public class CommonHandlerTest {
 
     private static final CommonHandler HTTP_SERVER_HANDLER =
             new CommonHandler(false, mock(LayoutService.class), new HashMap<Pattern, HttpService>(),
-                    mock(HttpSessionManager.class), new ArrayList<Object>(), mock(Clock.class));
+                    mock(HttpSessionManager.class), new ArrayList<Object>(),
+                    mock(McpServer.class), mock(Clock.class));
 
     @Test
     public void shouldCreateJsonServiceExceptionResponse() throws Exception {

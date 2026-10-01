@@ -80,9 +80,29 @@ class HttpSessionManager {
     }
 
     CommonResponse login(String username, String password) throws Exception {
-        if (username.equalsIgnoreCase("anonymous")) {
+        ImmutableSession session = authenticate(username, password);
+        if (session == null) {
             auditFailedLogin(username);
             return buildIncorrectLoginResponse();
+        }
+        return createSession(session);
+    }
+
+    // used for http basic authentication (mcp endpoint), no session is created
+    @Nullable
+    Authentication authenticateBasic(String username, String password) throws Exception {
+        ImmutableSession session = authenticate(username, password);
+        if (session == null) {
+            auditFailedLogin(username);
+            return null;
+        }
+        return session.createAuthentication(central, configRepository);
+    }
+
+    private @Nullable ImmutableSession authenticate(String username, String password)
+            throws Exception {
+        if (username.equalsIgnoreCase("anonymous")) {
+            return null;
         }
         UserConfig userConfig = getUserConfigCaseInsensitive(username);
         if (userConfig == null || userConfig.ldap()) {
@@ -91,21 +111,19 @@ class HttpSessionManager {
                 roles = authenticateAgainstLdapAndGetGlowrootRoles(username, password);
             } catch (AuthenticationException e) {
                 logger.debug(e.getMessage(), e);
-                auditFailedLogin(username);
-                return buildIncorrectLoginResponse();
+                return null;
             }
             if (userConfig != null) {
                 roles = Sets.newHashSet(roles);
                 roles.addAll(userConfig.roles());
             }
             if (!roles.isEmpty()) {
-                return createSession(username, roles, true);
+                return newSession(username, roles, true);
             }
         } else if (validatePassword(password, userConfig.passwordHash())) {
-            return createSession(userConfig.username(), userConfig.roles(), false);
+            return newSession(userConfig.username(), userConfig.roles(), false);
         }
-        auditFailedLogin(username);
-        return buildIncorrectLoginResponse();
+        return null;
     }
 
     void signOut(CommonRequest request) throws Exception {
@@ -182,15 +200,18 @@ class HttpSessionManager {
                 .build();
     }
 
-    private CommonResponse createSession(String username, Set<String> roles, boolean ldap)
-            throws Exception {
-        String sessionId = new BigInteger(130, secureRandom).toString(32);
-        ImmutableSession session = ImmutableSession.builder()
+    private ImmutableSession newSession(String username, Set<String> roles, boolean ldap) {
+        return ImmutableSession.builder()
                 .caseAmbiguousUsername(username)
                 .ldap(ldap)
                 .roles(roles)
                 .lastRequest(clock.currentTimeMillis())
                 .build();
+    }
+
+    private CommonResponse createSession(ImmutableSession session) throws Exception {
+        String sessionId = new BigInteger(130, secureRandom).toString(32);
+        String username = session.caseAmbiguousUsername();
         sessionMap.put(sessionId, session);
 
         String layoutJson = layoutService
