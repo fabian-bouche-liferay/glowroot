@@ -53,10 +53,14 @@ In central mode `agentId` is required (use `list_agents`); in embedded mode it c
 | `get_transaction_service_calls` | Service calls sorted by total time |
 | `list_traces` | Slow traces (or error traces with `errorsOnly`) with `traceId` / `agentId` |
 | `get_trace` | Trace header (headline, duration, attributes, error, timers, thread stats) |
-| `get_trace_entries` | Trace entries |
-| `get_trace_queries` | Queries executed during a trace |
+| `get_trace_entries` | Trace entries (query entries carry an abbreviated `queryText`) |
+| `get_trace_queries` | Queries executed during a trace.|
 | `list_gauges` | JVM gauges that have values in the time range |
 | `get_gauge_values` | Values over time of one or more gauges (`gaugeNames`) |
+
+Trace entries and trace queries resolve the query text in place (`queryText`, plus
+`fullQueryTextSha1` when Glowroot truncated it) instead of returning the UI's
+`sharedQueryTextIndex` / `sharedQueryTexts` indirection.
 
 Chart data series are omitted from the overview/percentiles/throughput tools unless
 `includeChartSeries` is `true`, to keep responses small.

@@ -20,6 +20,7 @@ import java.util.Map;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.BaseEncoding;
@@ -320,6 +321,53 @@ public class McpServerTest {
         JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
         assertThat(text.has("allGauges")).isFalse();
         assertThat(text.path("dataPointIntervalMillis").asInt()).isEqualTo(5000);
+    }
+
+    @Test
+    public void shouldInlineSharedQueryTextsInTraceQueriesSortedByTotalTime() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/trace/queries"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"queries\":["
+                        + "{\"type\":\"SQL\",\"sharedQueryTextIndex\":0,"
+                        + "\"totalDurationNanos\":10.0,\"executionCount\":1},"
+                        + "{\"type\":\"SQL\",\"sharedQueryTextIndex\":1,"
+                        + "\"totalDurationNanos\":99.0,\"executionCount\":312}],"
+                        + "\"sharedQueryTexts\":[{\"fullText\":\"select 1\"},"
+                        + "{\"truncatedText\":\"select a\",\"truncatedEndText\":\"where b=?\","
+                        + "\"fullTextSha1\":\"abc\"}]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_trace_queries", "{\"traceId\":\"t1\"}")), commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.has("sharedQueryTexts")).isFalse();
+        JsonNode first = text.at("/queries/0");
+        assertThat(first.path("executionCount").asInt()).isEqualTo(312);
+        assertThat(first.path("queryText").asText()).isEqualTo("select a ... where b=?");
+        assertThat(first.path("fullQueryTextSha1").asText()).isEqualTo("abc");
+        assertThat(first.has("sharedQueryTextIndex")).isFalse();
+        assertThat(text.at("/queries/1/queryText").asText()).isEqualTo("select 1");
+        assertThat(text.at("/queries/1").has("fullQueryTextSha1")).isFalse();
+    }
+
+    @Test
+    public void shouldInlineAbbreviatedQueryTextsInTraceEntries() throws Exception {
+        String longQuery = "select " + Strings.repeat("x", 400);
+        when(commonHandler.handleInternalGet(eq("/backend/trace/entries"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"entries\":[{\"message\":\"m\",\"childEntries\":["
+                        + "{\"queryMessage\":{\"sharedQueryTextIndex\":0,\"prefix\":\"jdbc: \"}}"
+                        + "]}],\"sharedQueryTexts\":[{\"fullText\":\"" + longQuery + "\"}]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_trace_entries", "{\"traceId\":\"t1\"}")), commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.has("sharedQueryTexts")).isFalse();
+        JsonNode queryMessage = text.at("/entries/0/childEntries/0/queryMessage");
+        assertThat(queryMessage.has("sharedQueryTextIndex")).isFalse();
+        assertThat(queryMessage.path("prefix").asText()).isEqualTo("jdbc: ");
+        String queryText = queryMessage.path("queryText").asText();
+        assertThat(queryText).startsWith("select xxx").contains(" ... ");
+        assertThat(queryText.length()).isEqualTo(120 + 5 + 120);
     }
 
     @Test

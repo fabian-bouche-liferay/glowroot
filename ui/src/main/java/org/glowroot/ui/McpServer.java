@@ -17,6 +17,7 @@ package org.glowroot.ui;
 
 import java.io.StringWriter;
 import java.net.URI;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -423,14 +424,19 @@ class McpServer {
                 (args, backend) -> backend.get("/backend/trace/header", traceParams(args))));
 
         list.add(new Tool("get_trace_entries",
-                "Trace entries (timeline of instrumented calls) of a trace.",
+                "Trace entries (timeline of instrumented calls) of a trace. Query entries carry an"
+                        + " abbreviated queryText, use get_trace_queries for the full text.",
                 schema().traceAgentId().traceId(),
-                (args, backend) -> backend.get("/backend/trace/entries", traceParams(args))));
+                (args, backend) -> inlineSharedQueryTexts(
+                        backend.get("/backend/trace/entries", traceParams(args)), true)));
 
         list.add(new Tool("get_trace_queries",
-                "Aggregated queries executed during a trace.",
+                "Queries executed during a trace, aggregated by query text and sorted by total"
+                        + " time (executionCount helps spotting N+1 patterns). When Glowroot"
+                        + " truncated the text, use get_full_query_text with fullQueryTextSha1.",
                 schema().traceAgentId().traceId(),
-                (args, backend) -> backend.get("/backend/trace/queries", traceParams(args))));
+                (args, backend) -> sortQueriesByTotalTime(inlineSharedQueryTexts(
+                        backend.get("/backend/trace/queries", traceParams(args)), false))));
 
         // ---- jvm gauges ----
 
@@ -569,6 +575,81 @@ class McpServer {
                 trace.put("partial", true);
             }
         }
+    }
+
+    // trace entries and trace queries reference their query text by index into a trailing
+    // sharedQueryTexts table, which is impractical for mcp clients, so resolve the text in place
+    // (note: no JsonNode variable is re-assigned with another node type here, see callTool())
+    private static String inlineSharedQueryTexts(String json, boolean abbreviate)
+            throws Exception {
+        JsonNode node = mapper.readTree(json);
+        if (!(node instanceof ObjectNode)) {
+            return json;
+        }
+        JsonNode sharedQueryTexts = ((ObjectNode) node).remove("sharedQueryTexts");
+        if (sharedQueryTexts == null) {
+            return json;
+        }
+        inlineSharedQueryTexts(node, sharedQueryTexts, abbreviate);
+        return mapper.writeValueAsString(node);
+    }
+
+    private static void inlineSharedQueryTexts(JsonNode node, JsonNode sharedQueryTexts,
+            boolean abbreviate) {
+        if (node.isArray()) {
+            for (JsonNode element : node) {
+                inlineSharedQueryTexts(element, sharedQueryTexts, abbreviate);
+            }
+            return;
+        }
+        if (!(node instanceof ObjectNode)) {
+            return;
+        }
+        ObjectNode objectNode = (ObjectNode) node;
+        JsonNode index = objectNode.remove("sharedQueryTextIndex");
+        if (index != null) {
+            setQueryText(objectNode, sharedQueryTexts.path(index.asInt()), abbreviate);
+        }
+        for (JsonNode child : objectNode) {
+            inlineSharedQueryTexts(child, sharedQueryTexts, abbreviate);
+        }
+    }
+
+    private static void setQueryText(ObjectNode objectNode, JsonNode sharedQueryText,
+            boolean abbreviate) {
+        JsonNode fullText = sharedQueryText.get("fullText");
+        if (fullText != null) {
+            String text = fullText.asText();
+            objectNode.put("queryText", abbreviate ? abbreviateQueryText(text) : text);
+            return;
+        }
+        // glowroot only kept the beginning and the end of long query texts in the trace
+        objectNode.put("queryText", sharedQueryText.path("truncatedText").asText() + " ... "
+                + sharedQueryText.path("truncatedEndText").asText());
+        objectNode.put("fullQueryTextSha1", sharedQueryText.path("fullTextSha1").asText());
+    }
+
+    private static String abbreviateQueryText(String text) {
+        if (text.length() <= 300) {
+            return text;
+        }
+        return text.substring(0, 120) + " ... " + text.substring(text.length() - 120);
+    }
+
+    private static String sortQueriesByTotalTime(String json) throws Exception {
+        JsonNode node = mapper.readTree(json);
+        JsonNode queriesNode = node.path("queries");
+        if (!(queriesNode instanceof ArrayNode)) {
+            return json;
+        }
+        ArrayNode queries = (ArrayNode) queriesNode;
+        List<JsonNode> sorted = Lists.newArrayList(queries);
+        Collections.sort(sorted, (left, right) -> Double.compare(
+                right.path("totalDurationNanos").asDouble(),
+                left.path("totalDurationNanos").asDouble()));
+        queries.removeAll();
+        queries.addAll(sorted);
+        return mapper.writeValueAsString(node);
     }
 
     private static String stripChartSeries(Args args, String json) throws Exception {
