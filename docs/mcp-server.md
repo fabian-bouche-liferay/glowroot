@@ -14,6 +14,19 @@ The endpoint is served by the same web server as the UI, in both modes:
 | Embedded | `http://<host>:4000/mcp` (+ context path) |
 | Central  | `http://<host>:4000/mcp` (+ context path) |
 
+## Download
+
+The `Embedded agent distribution` workflow (`.github/workflows/dist.yml`) builds the embedded
+agent distribution on every push and publishes it as a GitHub release asset:
+
+- latest `feature/mcp-server` build (pre-release, replaced on every push):
+  `https://github.com/<owner>/glowroot/releases/download/mcp-server-latest/glowroot-dist.zip`
+- a `v*` tag publishes `glowroot-<tag>-dist.zip` in a release named after the tag
+
+Unzip it and add `-javaagent:/path/to/glowroot/glowroot.jar` to the monitored JVM. The zip, not
+`glowroot.jar` alone, is needed: the embedded collector (H2 storage, UI, MCP server) is
+`lib/glowroot-embedded-collector.jar`.
+
 ## Transport
 
 - MCP *Streamable HTTP* transport, protocol versions `2025-06-18`, `2025-03-26` and `2024-11-05`.

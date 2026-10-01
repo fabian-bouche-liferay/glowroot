@@ -1,0 +1,111 @@
+name: Embedded agent distribution
+
+# Builds the embedded agent distribution (glowroot-*-dist.zip: glowroot.jar + lib/, the embedded
+# collector with H2, the UI and the MCP server) and publishes it as a GitHub release asset:
+# - every push to a tracked branch replaces the rolling "<last part of the branch>-latest"
+#   pre-release (e.g. mcp-server-latest for feature/mcp-server), so the zip is
+#   always at the same URL, e.g.
+#   https://github.com/<owner>/glowroot/releases/download/mcp-server-latest/glowroot-dist.zip
+# - a v* tag creates a release named after the tag
+#
+# Unlike release.yml (upstream releases: Maven Central, Docker Hub, yum repository), this only needs
+# the default GITHUB_TOKEN.
+
+on:
+  push:
+    branches:
+      - main
+      - feature/mcp-server
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Restore cache
+        uses: actions/cache@v5.0.3
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.cache/bower
+            ui/node
+            ui/node_modules
+          key: dist-${{ hashFiles('**/pom.xml', 'ui/package.json', 'ui/bower.json') }}
+          restore-keys: |
+            dist-
+
+      - name: Build the embedded agent distribution
+        run: |
+          mvn --batch-mode --no-transfer-progress clean install -pl agent/dist -am \
+              -DskipTests \
+              -Dglowroot.build.commit=$(git rev-parse HEAD)
+
+      - name: Run the MCP server tests
+        run: |
+          mvn --batch-mode --no-transfer-progress surefire:test -pl :glowroot-ui \
+              -Dtest='Mcp*Test,JsonServiceExceptionTest,CommonHandlerTest' \
+              -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Check the distribution
+        id: dist
+        run: |
+          zip=$(ls agent/dist/target/glowroot-agent-*-dist.zip)
+          version=$(basename "$zip" | sed -E 's/^glowroot-agent-(.*)-dist\.zip$/\1/')
+          # the embedded collector (UI and MCP server) must be in the zip
+          unzip -l "$zip" | grep -q 'glowroot/lib/glowroot-embedded-collector.jar'
+          unzip -p "$zip" glowroot/glowroot.jar > /tmp/glowroot.jar
+          build_time=$(unzip -p /tmp/glowroot.jar META-INF/MANIFEST.MF | sed -n 's/^Build-Time: //p' | tr -d '\r')
+          cp "$zip" glowroot-dist.zip
+          sha256sum glowroot-dist.zip > glowroot-dist.zip.sha256
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build-time=$build_time" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the zip as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: glowroot-${{ steps.dist.outputs.version }}-dist
+          path: glowroot-dist.zip
+          retention-days: 30
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.dist.outputs.version }}
+          BUILD_TIME: ${{ steps.dist.outputs.build-time }}
+        run: |
+          notes="Embedded agent distribution, version $VERSION, built $BUILD_TIME from ${GITHUB_SHA::9} ($GITHUB_REF_NAME).
+
+          Install: unzip, then add \`-javaagent:/path/to/glowroot/glowroot.jar\` to the JVM arguments.
+          The UI and the MCP server (\`/mcp\`, see docs/mcp-server.md) listen on http://localhost:4000."
+
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            tag=$GITHUB_REF_NAME
+            cp glowroot-dist.zip "glowroot-$tag-dist.zip"
+            gh release create "$tag" --verify-tag --title "Glowroot $tag" --notes "$notes" \
+                "glowroot-$tag-dist.zip" glowroot-dist.zip.sha256
+          else
+            # rolling pre-release, replaced by every push (the tag moves to the new commit)
+            tag="${GITHUB_REF_NAME##*/}-latest"
+            gh release delete "$tag" --yes --cleanup-tag || true
+            gh release create "$tag" --target "$GITHUB_SHA" --prerelease --latest=false \
+                --title "Latest $GITHUB_REF_NAME build ($VERSION)" --notes "$notes" \
+                glowroot-dist.zip glowroot-dist.zip.sha256
+          fi
+          echo "Download: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag/" >> "$GITHUB_STEP_SUMMARY"
