@@ -54,6 +54,7 @@ public class McpServerTest {
     private static final ObjectMapper mapper = new ObjectMapper();
 
     private static final long NOW = 1_000_000_000L;
+    private static final long NOW_ROUNDED_UP = 1_000_020_000L;
 
     private HttpSessionManager httpSessionManager;
     private CommonHandler commonHandler;
@@ -229,8 +230,9 @@ public class McpServerTest {
         assertThat(params.get("transaction-type")).containsExactly("Web");
         assertThat(params.get("sort-order")).containsExactly("total-time");
         assertThat(params.get("limit")).containsExactly("20");
-        assertThat(params.get("to")).containsExactly(Long.toString(NOW));
-        assertThat(params.get("from")).containsExactly(Long.toString(NOW - 3600000));
+        // default "to" is rounded up to the minute, like the UI
+        assertThat(params.get("to")).containsExactly(Long.toString(NOW_ROUNDED_UP));
+        assertThat(params.get("from")).containsExactly(Long.toString(NOW_ROUNDED_UP - 3600000));
 
         JsonNode result = json(response).path("result");
         assertThat(result.path("isError").asBoolean()).isFalse();
@@ -238,7 +240,7 @@ public class McpServerTest {
         assertThat(text.has("overall")).isTrue();
         assertThat(text.path("glowrootUrl").asText()).isEqualTo(
                 "http://localhost:4000/o/glowroot/transaction/average?transaction-type=Web"
-                        + "&from=" + (NOW - 3600000) + "&to=" + NOW);
+                        + "&from=" + (NOW_ROUNDED_UP - 3600000) + "&to=" + NOW_ROUNDED_UP);
     }
 
     @Test

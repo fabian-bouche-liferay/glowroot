@@ -1957,7 +1957,13 @@ class McpServer {
 
         private long to() throws ToolException {
             Long to = longValue("to");
-            return to == null ? clock.currentTimeMillis() : to;
+            if (to != null) {
+                return to;
+            }
+            // rounded up to the minute like the UI, otherwise the live (not yet stored) data
+            // point, captured "now", falls after the range and is left out of merged values
+            long now = clock.currentTimeMillis();
+            return (now + MINUTES.toMillis(1) - 1) / MINUTES.toMillis(1) * MINUTES.toMillis(1);
         }
 
         private boolean has(String name) {
@@ -2081,7 +2087,7 @@ class McpServer {
             numberProperty("from", "Start of the time range, epoch milliseconds"
                     + " (default: 60 minutes before to)");
             return numberProperty("to", "End of the time range, epoch milliseconds"
-                    + " (default: now)");
+                    + " (default: now, rounded up to the minute)");
         }
 
         private SchemaBuilder profileSummaryOptions() {

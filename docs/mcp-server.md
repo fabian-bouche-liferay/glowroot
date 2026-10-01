@@ -4,8 +4,8 @@ Glowroot exposes a [Model Context Protocol](https://modelcontextprotocol.io) ser
 clients (Claude Code, Claude Desktop, IDE assistants, ...) can query monitoring data and adjust
 the monitoring configuration.
 
-It covers **transactions, traces and JVM gauges** (read), and the **slow trace threshold, gauges
-and instrumentation** configuration (write).
+It covers **transactions, traces, thread profiles, errors and the JVM** (read), and the **slow
+trace threshold, gauges and instrumentation** configuration (write).
 
 The endpoint is served by the same web server as the UI, in both modes:
 
@@ -51,7 +51,8 @@ correct for the address the MCP client used to reach Glowroot.
 
 ## Tools
 
-All times are epoch milliseconds. `from`/`to` default to the last 60 minutes.
+All times are epoch milliseconds. `from`/`to` default to the last 60 minutes (`to` rounded up to
+the minute, like the UI, so that the live data point is included).
 In central mode `agentId` is required (use `list_agents`); in embedded mode it can be omitted.
 Configuration tools need an agent id, not an agent rollup id.
 
@@ -63,17 +64,23 @@ Configuration tools need an agent id, not an agent rollup id.
 | `list_transaction_types` | Transaction types, default transaction type, default percentiles and gauges |
 | `get_transaction_summaries` | Overall summary and top transaction names (`sortOrder`, `limit`) |
 | `get_transaction_overview` | Merged timer breakdown, average duration, transaction count |
-| `get_transaction_percentiles` | Response time percentiles (`percentiles`, default 50/95/99) |
+| `get_transaction_percentiles` | Response time percentiles (`valueMillis`, `valueNanos`; default 50/95/99) |
+| `get_transaction_profile` | Thread profile summary: hottest frames, hot path with branch points, thread states |
+| `get_error_summary` | Error messages with counts, and the transaction names with the most errors |
 | `get_transaction_throughput` | Transaction count and transactions per minute |
-| `get_transaction_queries` | Queries sorted by total time |
+| `get_transaction_queries` | Queries of a name, or of a whole type (`sortBy`, `limit`) |
 | `get_full_query_text` | Full text of a truncated query |
 | `get_transaction_service_calls` | Service calls sorted by total time |
 | `list_traces` | Slow traces (or error traces with `errorsOnly`) with `traceId` / `agentId` |
 | `get_trace` | Trace header (headline, duration, attributes, error, timers, thread stats) |
-| `get_trace_entries` | Trace entries (query entries carry an abbreviated `queryText`) |
+| `get_trace_entries` | Trace entries, flattened with depth: filters, `offset`/`limit` paging, `aggregate` mode |
 | `get_trace_queries` | Queries executed during a trace, with `queryText`, sorted by total time |
+| `get_trace_profile` | Thread profile summary of one trace (main or auxiliary threads) |
 | `list_gauges` | JVM gauges that have values in the time range |
-| `get_gauge_values` | Values over time of one or more gauges (`gaugeNames`) |
+| `get_gauge_values` | Values over time of one or more gauges (`gaugeNames`), or around a trace (`aroundTraceId`) |
+| `read_mbean_values` | Current attribute values of an MBean, without creating a gauge |
+| `get_thread_dump` | Threads running transactions in full, deadlocks, other threads grouped by state |
+| `list_plugins` | Instrumentation plugins and their properties |
 | `get_transaction_config` | Slow trace threshold, threshold overrides, profiling interval |
 | `list_gauge_configs` | Configured gauges, with the `version` used by `delete_gauge` |
 | `search_mbeans` | MBean object names of the running JVM matching a partial name |
@@ -83,16 +90,19 @@ Configuration tools need an agent id, not an agent rollup id.
 | `search_methods` | Method names of a class |
 | `get_method_signatures` | Signatures of a method (to target one overload) |
 
+`get_heap_histogram` is also available; it is annotated as a write tool because it briefly pauses
+the JVM. Heap dumps and forced GCs are intentionally not exposed.
+
 ### Write
 
 | Tool | Description |
 |------|-------------|
 | `set_slow_trace_threshold` | Default threshold, or add / update / remove a per transaction type, name, user override |
-| `create_gauge` | Capture MBean attributes as gauges (`counterAttributes` are captured as a rate per second) |
+| `create_gauge` | Capture MBean attributes as gauges (`counterAttributes` as a rate per second); validated against the MBean, idempotent, adds missing attributes to an existing gauge |
 | `delete_gauge` | Delete a gauge config (destructive) |
-| `create_instrumentation` | Pointcut on a method: `timer`, `trace-entry`, `transaction` or `other` |
+| `create_instrumentation` | Pointcut on a method: `timer`, `trace-entry`, `transaction` or `other`; `dryRun` validates the class, method and overload without saving |
 | `delete_instrumentation` | Delete instrumentation configs (destructive) |
-| `apply_instrumentation_changes` | Re-weave already loaded classes so instrumentation changes take effect without a JVM restart |
+| `apply_instrumentation_changes` | Re-weave already loaded classes so instrumentation changes take effect without a JVM restart (`destructiveHint`: it can pause the JVM); returns the class count and duration |
 
 Write tools are annotated `readOnlyHint: false` (and `destructiveHint: true` for deletions), so MCP
 clients can ask for confirmation. Changes are logged in the Glowroot audit log like UI changes.
@@ -106,6 +116,13 @@ instrumentation with an invalid timer name, so the tool rejects it). Templates c
 supports class retransformation (the `-javaagent` agent does).
 
 ### Response shaping
+
+Durations, bytes and counts are integers (the UI's JSON uses doubles such as `2.85202499E10`), and
+object results are also returned as `structuredContent`. An unknown or expired trace id is a tool
+error.
+
+Profile summaries hide the servlet container / filter chain trunk from the hot path
+(`collapseFramePrefixes`, `[]` to show everything) and `raw: true` returns the whole tree.
 
 Trace entries and trace queries resolve the query text in place (`queryText`, plus
 `fullQueryTextSha1` when Glowroot truncated it) instead of returning the UI's
