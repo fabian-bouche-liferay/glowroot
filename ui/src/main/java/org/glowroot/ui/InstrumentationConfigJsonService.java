@@ -198,7 +198,12 @@ class InstrumentationConfigJsonService {
             @BindRequest InstrumentationConfigDto configDto) throws Exception {
         InstrumentationConfig config = configDto.convert();
         String version = configDto.version().get();
-        configRepository.updateInstrumentationConfig(agentId, config, version, CassandraProfile.web).toCompletableFuture().join();
+        try {
+            configRepository.updateInstrumentationConfig(agentId, config, version,
+                    CassandraProfile.web).toCompletableFuture().join();
+        } catch (Exception e) {
+            throw JsonServiceException.fromOptimisticLock(e);
+        }
         return getInstrumentationConfigInternal(agentId, Versions.getVersion(config));
     }
 
@@ -206,7 +211,12 @@ class InstrumentationConfigJsonService {
             permission = "agent:config:edit:instrumentation")
     void removeInstrumentationConfig(@BindAgentId String agentId,
             @BindRequest InstrumentationDeleteRequest request) throws Exception {
-        configRepository.deleteInstrumentationConfigs(agentId, request.versions(), CassandraProfile.web).toCompletableFuture().join();
+        try {
+            configRepository.deleteInstrumentationConfigs(agentId, request.versions(),
+                    CassandraProfile.web).toCompletableFuture().join();
+        } catch (Exception e) {
+            throw JsonServiceException.fromOptimisticLock(e);
+        }
     }
 
     @POST(path = "/backend/config/instrumentation/import",

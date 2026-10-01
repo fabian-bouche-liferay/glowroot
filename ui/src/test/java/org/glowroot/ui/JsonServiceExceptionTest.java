@@ -15,8 +15,12 @@
  */
 package org.glowroot.ui;
 
+import java.util.concurrent.CompletionException;
+
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.junit.jupiter.api.Test;
+
+import org.glowroot.common2.repo.ConfigRepository.OptimisticLockException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -28,5 +32,20 @@ public class JsonServiceExceptionTest {
         JsonServiceException exception = new JsonServiceException(HttpResponseStatus.NOT_FOUND);
         // then
         assertThat(exception.getStatus()).isEqualTo(HttpResponseStatus.NOT_FOUND);
+    }
+
+    @Test
+    public void shouldMapOptimisticLockToPreconditionFailed() {
+        Exception direct = JsonServiceException.fromOptimisticLock(new OptimisticLockException());
+        // e.g. central, where the repository future wraps the exception
+        Exception wrapped = JsonServiceException
+                .fromOptimisticLock(new CompletionException(new OptimisticLockException()));
+        Exception other = new IllegalStateException("other");
+
+        assertThat(((JsonServiceException) direct).getStatus())
+                .isEqualTo(HttpResponseStatus.PRECONDITION_FAILED);
+        assertThat(((JsonServiceException) wrapped).getStatus())
+                .isEqualTo(HttpResponseStatus.PRECONDITION_FAILED);
+        assertThat(JsonServiceException.fromOptimisticLock(other)).isSameAs(other);
     }
 }

@@ -2088,11 +2088,8 @@ class McpServer {
             if (status.equals(HttpResponseStatus.NOT_FOUND)) {
                 throw new ToolException("Not found (or no data)");
             }
-            if (status.equals(HttpResponseStatus.PRECONDITION_FAILED)) {
-                throw new ToolException("The configuration was modified concurrently, read it"
-                        + " again and retry");
-            }
-            if (content.contains("OptimisticLockException")) {
+            if (status.equals(HttpResponseStatus.PRECONDITION_FAILED)
+                    || content.contains("OptimisticLockException")) {
                 throw new ToolException("The version is stale: this configuration changed since"
                         + " it was read, read it again (list_gauge_configs,"
                         + " list_instrumentations, get_transaction_config) and retry");

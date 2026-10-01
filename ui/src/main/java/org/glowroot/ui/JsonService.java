@@ -19,6 +19,8 @@ import java.lang.annotation.Retention;
 
 import io.netty.handler.codec.http.HttpResponseStatus;
 
+import org.glowroot.common2.repo.ConfigRepository.OptimisticLockException;
+
 import static java.lang.annotation.RetentionPolicy.RUNTIME;
 
 // marker annotation
@@ -79,5 +81,16 @@ class JsonServiceException extends RuntimeException {
 
     HttpResponseStatus getStatus() {
         return HttpResponseStatus.valueOf(statusCode);
+    }
+
+    // a stale version (the config changed since it was read) is an expected error, not a 500
+    // with a logged stack trace; the cause may be wrapped (e.g. CompletionException in central)
+    static Exception fromOptimisticLock(Exception e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof OptimisticLockException) {
+                return new JsonServiceException(HttpResponseStatus.PRECONDITION_FAILED, t);
+            }
+        }
+        return e;
     }
 }

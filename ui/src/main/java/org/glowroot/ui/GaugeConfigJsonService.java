@@ -162,6 +162,8 @@ class GaugeConfigJsonService {
             // log exception at debug level
             logger.debug(e.getMessage(), e);
             throw new JsonServiceException(CONFLICT, "mbeanObjectName");
+        } catch (Exception e) {
+            throw JsonServiceException.fromOptimisticLock(e);
         }
         return getGaugeResponse(agentId, gaugeConfig);
     }
@@ -169,7 +171,12 @@ class GaugeConfigJsonService {
     @POST(path = "/backend/config/gauges/remove", permission = "agent:config:edit:gauges")
     void removeGauge(@BindAgentId String agentId, @BindRequest GaugeConfigRequest request)
             throws Exception {
-        configRepository.deleteGaugeConfig(agentId, request.version().get(), web).toCompletableFuture().join();
+        try {
+            configRepository.deleteGaugeConfig(agentId, request.version().get(), web)
+                    .toCompletableFuture().join();
+        } catch (Exception e) {
+            throw JsonServiceException.fromOptimisticLock(e);
+        }
     }
 
     private String getGaugeResponse(String agentId, GaugeConfig gaugeConfig) throws Exception {
