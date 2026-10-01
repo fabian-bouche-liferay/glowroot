@@ -121,8 +121,22 @@ Durations, bytes and counts are integers (the UI's JSON uses doubles such as `2.
 object results are also returned as `structuredContent`. An unknown or expired trace id is a tool
 error.
 
-Profile summaries hide the servlet container / filter chain trunk from the hot path
-(`collapseFramePrefixes`, `[]` to show everything) and `raw: true` returns the whole tree.
+Profile summaries report the trunk shared by every sample once (`trunk`), list the hottest frames
+below it (container, filter chain, reflection and Glowroot frames are left out:
+`collapseFramePrefixes`, `[]` to keep everything), and give the hot path as its branch points and
+its end (`fullHotPath` for every frame, `raw: true` for the whole tree). Below 20 samples a warning
+says the profile is not conclusive.
+
+`get_trace_entries` and `get_trace_queries` report `entryLimitExceeded` / `queryLimitExceeded` when
+the trace hit Glowroot's capture limits: entries are then partial, query aggregates are not.
+
+`create_instrumentation` rejects template placeholders the agent would print literally (unknown
+names, an argument index beyond the method's parameters, `{{_}}` on a void method) and warns about
+wildcards. `create_gauge` counts the MBeans an object name pattern matches (`matchedMBeans`,
+`seriesCount`).
+
+Structured results have no `outputSchema`: clients validate `structuredContent` against it, and a
+hand-written copy of the UI's JSON formats would turn every format drift into client errors.
 
 Trace entries and trace queries resolve the query text in place (`queryText`, plus
 `fullQueryTextSha1` when Glowroot truncated it) instead of returning the UI's

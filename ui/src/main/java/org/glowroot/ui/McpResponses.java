@@ -111,11 +111,14 @@ final class McpResponses {
 
     // ---- thread profiles ----
 
-    // summary of a (transaction or trace) thread profile, as an agent needs it: sample count,
-    // hottest frames (inclusive and self), the hot path down to where it branches, and leaf thread
-    // states
+    // below this many samples, a profile mostly says where the thread happened to be
+    private static final int LOW_SAMPLE_COUNT = 20;
+
+    // summary of a (transaction or trace) thread profile, as an agent needs it: sample count, the
+    // trunk shared by all samples (reported once), hottest frames below it (inclusive and self),
+    // the branch points of the hot path, and leaf thread states
     static ObjectNode summarizeProfile(JsonNode profile, int topFrames, double hotPathMinPercent,
-            List<String> collapsedFramePrefixes) {
+            List<String> collapsedFrames, boolean fullHotPath) {
         ObjectNode summary = nodes.objectNode();
         long totalSamples = 0;
         for (JsonNode rootNode : profile.path("rootNodes")) {
@@ -125,27 +128,71 @@ final class McpResponses {
         if (totalSamples == 0) {
             return summary;
         }
+        if (totalSamples < LOW_SAMPLE_COUNT) {
+            summary.putArray("warnings").add("only " + totalSamples + " samples: widen the time"
+                    + " range, or lower profilingIntervalMillis (see get_transaction_config),"
+                    + " before drawing conclusions");
+        }
+        // the trunk: frames every sample goes through (thread start, container, filters...)
+        Set<String> trunkFrames = Sets.newHashSet();
+        JsonNode trunkEnd = null;
+        int trunkDepth = 0;
+        JsonNode current = singleChild(profile.path("rootNodes"), totalSamples);
+        while (current != null) {
+            trunkFrames.add(current.path("stackTraceElement").asText());
+            trunkEnd = current;
+            trunkDepth++;
+            current = singleChild(current.path("childNodes"),
+                    current.path("sampleCount").asLong());
+        }
+        if (trunkEnd != null) {
+            ObjectNode trunk = summary.putObject("trunk");
+            trunk.put("frameCount", trunkDepth);
+            trunk.put("lastFrame", trunkEnd.path("stackTraceElement").asText());
+        }
         Map<String, Long> inclusive = Maps.newHashMap();
         Map<String, Long> self = Maps.newHashMap();
         Map<String, Long> leafStates = Maps.newTreeMap();
+        Map<String, Integer> depths = Maps.newHashMap();
         for (JsonNode rootNode : profile.path("rootNodes")) {
-            collectFrames(rootNode, Sets.<String>newHashSet(), inclusive, self, leafStates);
+            collectFrames(rootNode, 0, Sets.<String>newHashSet(), inclusive, self, leafStates,
+                    depths);
         }
-        summary.set("topFramesInclusive", topFrames(inclusive, totalSamples, topFrames));
-        summary.set("topFramesSelf", topFrames(self, totalSamples, topFrames));
+        for (String frame : Lists.newArrayList(inclusive.keySet())) {
+            if (trunkFrames.contains(frame) || isCollapsed(frame, collapsedFrames)) {
+                inclusive.remove(frame);
+            }
+        }
+        summary.set("topFramesInclusive",
+                topFrames(inclusive, depths, totalSamples, topFrames));
+        summary.set("topFramesSelf", topFrames(self, depths, totalSamples, topFrames));
         ObjectNode leafStatesNode = summary.putObject("leafThreadStates");
         for (Map.Entry<String, Long> entry : leafStates.entrySet()) {
             leafStatesNode.put(entry.getKey(), entry.getValue());
         }
-        summary.set("hotPath",
-                hotPath(profile, totalSamples, hotPathMinPercent, collapsedFramePrefixes));
+        summary.set("hotPath", hotPath(profile, totalSamples, hotPathMinPercent,
+                collapsedFrames, fullHotPath));
         return summary;
     }
 
-    private static void collectFrames(JsonNode node, Set<String> ancestorFrames,
-            Map<String, Long> inclusive, Map<String, Long> self, Map<String, Long> leafStates) {
+    // the only child carrying all the samples of its parent, if any
+    private static JsonNode singleChild(JsonNode children, long parentSamples) {
+        if (children.size() != 1) {
+            return null;
+        }
+        JsonNode child = children.get(0);
+        return child.path("sampleCount").asLong() == parentSamples ? child : null;
+    }
+
+    private static void collectFrames(JsonNode node, int depth, Set<String> ancestorFrames,
+            Map<String, Long> inclusive, Map<String, Long> self, Map<String, Long> leafStates,
+            Map<String, Integer> depths) {
         String frame = node.path("stackTraceElement").asText();
         long sampleCount = node.path("sampleCount").asLong();
+        Integer knownDepth = depths.get(frame);
+        if (knownDepth == null || depth < knownDepth) {
+            depths.put(frame, depth);
+        }
         boolean added = ancestorFrames.add(frame);
         if (added) {
             // count recursive frames only once per sample
@@ -154,7 +201,8 @@ final class McpResponses {
         long childSamples = 0;
         for (JsonNode childNode : node.path("childNodes")) {
             childSamples += childNode.path("sampleCount").asLong();
-            collectFrames(childNode, ancestorFrames, inclusive, self, leafStates);
+            collectFrames(childNode, depth + 1, ancestorFrames, inclusive, self, leafStates,
+                    depths);
         }
         long selfSamples = sampleCount - childSamples;
         if (selfSamples > 0) {
@@ -172,10 +220,18 @@ final class McpResponses {
         map.put(key, current == null ? delta : current + delta);
     }
 
-    private static ArrayNode topFrames(Map<String, Long> samples, long totalSamples, int limit) {
+    // most samples first, and on a tie the caller (shallowest frame) before its callees
+    private static ArrayNode topFrames(Map<String, Long> samples, Map<String, Integer> depths,
+            long totalSamples, int limit) {
         List<Map.Entry<String, Long>> entries = Lists.newArrayList(samples.entrySet());
-        Collections.sort(entries,
-                (left, right) -> Long.compare(right.getValue(), left.getValue()));
+        Collections.sort(entries, (left, right) -> {
+            int bySamples = Long.compare(right.getValue(), left.getValue());
+            if (bySamples != 0) {
+                return bySamples;
+            }
+            int byDepth = Integer.compare(depths.get(left.getKey()), depths.get(right.getKey()));
+            return byDepth != 0 ? byDepth : left.getKey().compareTo(right.getKey());
+        });
         ArrayNode frames = nodes.arrayNode();
         for (Map.Entry<String, Long> entry : entries.subList(0, Math.min(limit, entries.size()))) {
             ObjectNode frame = frames.addObject();
@@ -186,15 +242,15 @@ final class McpResponses {
         return frames;
     }
 
-    // follows the heaviest child from the root, reporting branch points (where the heaviest child
-    // carries clearly less than its parent) with their main alternatives; collapsed frames (e.g.
-    // the servlet container trunk) are walked through but not reported
+    // follows the heaviest child from the root; by default only reports the branch points (where
+    // the heaviest child carries clearly less than its parent, with the main alternatives) and
+    // where the path ends, fullHotPath reports every frame except the collapsed ones
     private static ArrayNode hotPath(JsonNode profile, long totalSamples,
-            double hotPathMinPercent, List<String> collapsedFramePrefixes) {
+            double hotPathMinPercent, List<String> collapsedFrames, boolean fullHotPath) {
         ArrayNode path = nodes.arrayNode();
         JsonNode current = heaviest(profile.path("rootNodes"));
         int depth = 0;
-        int collapsed = 0;
+        int skipped = 0;
         while (current != null
                 && percent(current.path("sampleCount").asLong(), totalSamples)
                         >= hotPathMinPercent) {
@@ -204,17 +260,21 @@ final class McpResponses {
             JsonNode next = heaviest(children);
             boolean branch = next != null && children.size() > 1
                     && next.path("sampleCount").asLong() < sampleCount * 0.8;
-            if (isCollapsed(frame, collapsedFramePrefixes) && !branch) {
-                collapsed++;
+            boolean end = next == null || percent(next.path("sampleCount").asLong(),
+                    totalSamples) < hotPathMinPercent;
+            boolean report = branch || end
+                    || fullHotPath && !isCollapsed(frame, collapsedFrames);
+            if (!report) {
+                skipped++;
             } else {
                 ObjectNode step = path.addObject();
                 step.put("depth", depth);
                 step.put("frame", frame);
                 step.put("sampleCount", sampleCount);
                 step.put("percent", percent(sampleCount, totalSamples));
-                if (collapsed > 0) {
-                    step.put("collapsedFramesAbove", collapsed);
-                    collapsed = 0;
+                if (skipped > 0) {
+                    step.put("framesSkippedAbove", skipped);
+                    skipped = 0;
                 }
                 String state = current.path("leafThreadState").asText("");
                 if (!state.isEmpty() && children.size() == 0) {
@@ -237,9 +297,12 @@ final class McpResponses {
         return path;
     }
 
-    private static boolean isCollapsed(String frame, List<String> collapsedFramePrefixes) {
-        for (String prefix : collapsedFramePrefixes) {
-            if (frame.startsWith(prefix)) {
+    // an entry starting with * matches anywhere in the frame (e.g. "*.doFilter("), any other
+    // entry is a prefix of the frame
+    private static boolean isCollapsed(String frame, List<String> collapsedFrames) {
+        for (String collapsed : collapsedFrames) {
+            if (collapsed.startsWith("*") ? frame.contains(collapsed.substring(1))
+                    : frame.startsWith(collapsed)) {
                 return true;
             }
         }
@@ -375,6 +438,21 @@ final class McpResponses {
                 right.path("totalDurationNanos").asLong(),
                 left.path("totalDurationNanos").asLong()));
         return sorted;
+    }
+
+    // ---- mbeans ----
+
+    // object names of the leaves of the UI's mbean tree (domain -> nested nodes -> leaves)
+    static void collectObjectNames(JsonNode node, List<String> objectNames) {
+        JsonNode objectName = node.get("objectName");
+        if (objectName != null && objectName.isTextual()) {
+            objectNames.add(objectName.asText());
+        }
+        for (JsonNode child : node) {
+            if (child.isContainerNode()) {
+                collectObjectNames(child, objectNames);
+            }
+        }
     }
 
     // ---- thread dump ----

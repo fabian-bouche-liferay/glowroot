@@ -739,6 +739,121 @@ public class McpServerTest {
     }
 
     @Test
+    public void shouldFlagTruncatedTraceEntries() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/trace/header"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"transactionType\":\"Web\",\"transactionName\":\"/\","
+                        + "\"captureTime\":1,\"entryLimitExceeded\":true}"));
+        when(commonHandler.handleInternalGet(eq("/backend/trace/entries"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"entries\":[{\"durationNanos\":1,\"message\":\"m\"}],"
+                        + "\"sharedQueryTexts\":[]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_trace_entries", "{\"traceId\":\"t1\",\"aggregate\":true}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("entryLimitExceeded").asBoolean()).isTrue();
+        assertThat(text.at("/warnings/0").asText()).contains("partial")
+                .contains("get_trace_queries");
+    }
+
+    @Test
+    public void shouldReportStaleVersion() throws Exception {
+        when(commonHandler.handleInternalPost(eq("/backend/config/gauges/remove"), anyMap(),
+                anyString(), eq(user))).thenReturn(new CommonResponse(
+                        HttpResponseStatus.INTERNAL_SERVER_ERROR, MediaType.JSON_UTF_8,
+                        "{\"message\":\"org.glowroot.common2.repo.ConfigRepository$"
+                                + "OptimisticLockException\"}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("delete_gauge", "{\"version\":\"old\"}")), commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("version is stale");
+    }
+
+    @Test
+    public void shouldRejectOutOfRangeTemplateArgument() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/config/matching-class-names"),
+                anyMap(), eq(user))).thenReturn(ok("[\"com.acme.Dao\"]"));
+        when(commonHandler.handleInternalGet(eq("/backend/config/method-signatures"), anyMap(),
+                eq(user))).thenReturn(ok("[{\"name\":\"find\",\"parameterTypes\":[\"long\"],"
+                        + "\"returnType\":\"void\",\"modifiers\":[]}]"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Dao\","
+                        + "\"methodName\":\"find\",\"captureKind\":\"trace-entry\","
+                        + "\"traceEntryMessageTemplate\":\"find {{9}}\",\"dryRun\":true}")),
+                commonHandler);
+
+        JsonNode result = json(response).path("result");
+        assertThat(result.path("isError").asBoolean()).isTrue();
+        assertThat(result.at("/content/0/text").asText()).contains("{{9}}")
+                .contains("takes 1 argument");
+    }
+
+    @Test
+    public void shouldRejectUnknownTemplatePlaceholderAndWarnOnWildcard() throws Exception {
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.Dao\","
+                        + "\"methodName\":\"find\",\"captureKind\":\"trace-entry\","
+                        + "\"traceEntryMessageTemplate\":\"find {{arg0}}\",\"dryRun\":true}")),
+                commonHandler);
+        assertThat(json(response).at("/result/content/0/text").asText())
+                .contains("unknown placeholder {{arg0}}");
+
+        response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("create_instrumentation", "{\"className\":\"com.acme.ModelListener\","
+                        + "\"methodName\":\"*\",\"captureKind\":\"timer\",\"dryRun\":true}")),
+                commonHandler);
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.path("warnings").toString()).contains("wildcard");
+    }
+
+    @Test
+    public void shouldReportUnknownMBean() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/jvm/mbean-attribute-map"), anyMap(),
+                eq(user))).thenReturn(new CommonResponse(HttpResponseStatus.NOT_FOUND));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("read_mbean_values", "{\"objectName\":\"nope:type=X\"}")),
+                commonHandler);
+
+        assertThat(json(response).at("/result/content/0/text").asText())
+                .isEqualTo("MBean not found: nope:type=X (use search_mbeans)");
+    }
+
+    @Test
+    public void shouldKeepTransactionCountsWithinTheMergedRange() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/transaction/average"), anyMap(),
+                eq(user))).thenReturn(ok("{\"transactionCounts\":{\"1000\":3,\"1500\":2,"
+                        + "\"2000\":1,\"2500\":9},\"mergedAggregate\":{\"transactionCount\":3}}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_transaction_overview",
+                        "{\"transactionType\":\"Web\",\"from\":1000,\"to\":2000}")),
+                commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        // same rule as mergedAggregate: from excluded, to included
+        assertThat(text.path("transactionCounts").toString()).isEqualTo("{\"1500\":2,\"2000\":1}");
+    }
+
+    @Test
+    public void shouldWarnOnUnknownGaugeName() throws Exception {
+        when(commonHandler.handleInternalGet(eq("/backend/jvm/gauges"), anyMap(), eq(user)))
+                .thenReturn(ok("{\"dataSeries\":[{\"name\":\"nope\",\"data\":[]}],"
+                        + "\"allGauges\":[{\"name\":\"java.lang:type=Memory:HeapMemoryUsage.used\"}]}"));
+
+        CommonResponse response = embedded().handle(post(basic("alice", "secret"),
+                toolCall("get_gauge_values", "{\"gaugeNames\":[\"nope\"]}")), commonHandler);
+
+        JsonNode text = mapper.readTree(json(response).at("/result/content/0/text").asText());
+        assertThat(text.at("/warnings/0").asText()).contains("nope").contains("list_gauges");
+    }
+
+    @Test
     public void shouldRejectTraceLookupWithAgentRollupId() throws Exception {
         CommonResponse response = central().handle(post(basic("alice", "secret"),
                 toolCall("get_trace", "{\"agentId\":\"group::\",\"traceId\":\"abc\"}")),

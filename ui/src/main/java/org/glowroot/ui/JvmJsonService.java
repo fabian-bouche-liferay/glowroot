@@ -24,11 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import javax.management.InstanceNotFoundException;
 import javax.management.ObjectName;
 
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Splitter;
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedMap;
@@ -77,6 +79,7 @@ import org.glowroot.wire.api.model.DownstreamServiceOuterClass.ThreadDump.LockIn
 import org.glowroot.wire.api.model.DownstreamServiceOuterClass.ThreadDump.Transaction;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static io.netty.handler.codec.http.HttpResponseStatus.NOT_FOUND;
 
 @JsonService
 class JvmJsonService {
@@ -428,12 +431,23 @@ class JvmJsonService {
     String getMBeanAttributeMap(@BindAgentId String agentId,
             @BindRequest MBeanAttributeMapRequest request) throws Exception {
         checkNotNull(liveJvmService);
-        MBeanDump mbeanDump =
-                liveJvmService.getMBeanDump(agentId, MBeanDumpKind.SOME_MBEANS_INCLUDE_ATTRIBUTES,
-                        ImmutableList.of(request.objectName()));
+        MBeanDump mbeanDump;
+        try {
+            mbeanDump = liveJvmService.getMBeanDump(agentId,
+                    MBeanDumpKind.SOME_MBEANS_INCLUDE_ATTRIBUTES,
+                    ImmutableList.of(request.objectName()));
+        } catch (Exception e) {
+            if (Throwables.getRootCause(e) instanceof InstanceNotFoundException) {
+                // expected for a mistyped object name, no need to log a stack trace
+                logger.debug(e.getMessage(), e);
+                throw new JsonServiceException(NOT_FOUND,
+                        "Could not find mbean with object name: " + request.objectName());
+            }
+            throw e;
+        }
         List<MBeanDump.MBeanInfo> mbeanInfos = mbeanDump.getMbeanInfoList();
         if (mbeanInfos.isEmpty()) {
-            throw new IllegalStateException(
+            throw new JsonServiceException(NOT_FOUND,
                     "Could not find mbean with object name: " + request.objectName());
         }
         if (mbeanInfos.size() > 1) {

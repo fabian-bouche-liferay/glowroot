@@ -142,7 +142,20 @@ public class Gauges {
 
     private static int processNextKeyValue(String mbeanObjectName, int fromIndex,
             List<String> displayParts) {
-        int index = mbeanObjectName.indexOf('=', fromIndex);
+        int start = fromIndex;
+        if (mbeanObjectName.charAt(start) == ',') {
+            // separator after a quoted value
+            start++;
+            if (start == mbeanObjectName.length()) {
+                return start;
+            }
+        }
+        if (mbeanObjectName.charAt(start) == '*') {
+            // property list pattern, e.g. org.ehcache:type=CacheStatistics,*
+            displayParts.add("*");
+            return start + 1 == mbeanObjectName.length() ? start + 1 : start + 2;
+        }
+        int index = mbeanObjectName.indexOf('=', start);
         if (index == -1) {
             // this is unexpected
             return -1;

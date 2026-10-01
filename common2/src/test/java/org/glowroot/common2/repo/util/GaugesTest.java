@@ -29,4 +29,16 @@ public class GaugesTest {
                 + ":CollectionTime[counter]");
         assertThat(gauge.unit()).isEqualTo("milliseconds per second");
     }
+
+    @Test
+    public void shouldDisplayPropertyListPattern() {
+        assertThat(Gauges.getDisplayParts("org.ehcache:type=CacheStatistics,*"))
+                .containsExactly("org.ehcache", "CacheStatistics", "*");
+        assertThat(Gauges.getDisplayParts("*:type=Pool,*"))
+                .containsExactly("*", "Pool", "*");
+        assertThat(Gauges.getDisplayParts("Catalina:type=ThreadPool,name=\"http-nio-8080\",*"))
+                .containsExactly("Catalina", "ThreadPool", "http-nio-8080", "*");
+        assertThat(Gauges.getDisplayParts("java.lang:type=GarbageCollector,name=*"))
+                .containsExactly("java.lang", "GarbageCollector", "*");
+    }
 }

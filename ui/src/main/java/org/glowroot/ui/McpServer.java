@@ -22,7 +22,11 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -437,8 +441,8 @@ class McpServer {
                         + " for a transaction type, or a single transaction name.",
                 schema().agentId().transactionType().transactionName().timeRange()
                         .includeChartSeries(),
-                (args, backend) -> withUrl(stripChartSeries(args,
-                        backend.get("/backend/transaction/average", transactionParams(args))),
+                (args, backend) -> withUrl(alignTransactionCounts(args, stripChartSeries(args,
+                        backend.get("/backend/transaction/average", transactionParams(args)))),
                         "", backend.uiUrl("transaction/average", uiTransactionParams(args)))));
 
         list.add(new Tool("get_transaction_percentiles",
@@ -456,9 +460,9 @@ class McpServer {
                         percentiles.add("95");
                         percentiles.add("99");
                     }
-                    JsonNode node = mapper.readTree(stripChartSeries(args,
-                            backend.get("/backend/transaction/percentiles",
-                                    transactionParams(args).putAll("percentile", percentiles))));
+                    JsonNode node = mapper.readTree(alignTransactionCounts(args,
+                            stripChartSeries(args, backend.get("/backend/transaction/percentiles",
+                                    transactionParams(args).putAll("percentile", percentiles)))));
                     McpResponses.addPercentileMillis(node);
                     return withUrl(mapper.writeValueAsString(node), "",
                             backend.uiUrl("transaction/percentiles", uiTransactionParams(args)));
@@ -595,16 +599,27 @@ class McpServer {
                         .intProperty("offset", "Index of the first matching entry (default 0)")
                         .intProperty("limit", "Max entries (or groups) returned (default 100)"),
                 (args, backend) -> {
-                    JsonNode entries = mapper.readTree(inlineSharedQueryTexts(checkTraceFound(
-                            backend.get("/backend/trace/entries", traceParams(args))), true));
+                    String header = checkTraceFound(
+                            backend.get("/backend/trace/header", traceParams(args)));
+                    JsonNode entries = mapper.readTree(inlineSharedQueryTexts(
+                            backend.get("/backend/trace/entries", traceParams(args)), true));
                     Double minDurationMillis = args.number("minDurationMillis");
+                    boolean aggregate = args.bool("aggregate", false);
                     ObjectNode page = McpResponses.pageEntries(entries,
                             minDurationMillis == null ? 0 : minDurationMillis,
                             args.string("kind", "all"), args.string("messageContains", ""),
-                            args.bool("aggregate", false), args.integer("offset", 0),
-                            args.integer("limit", 100));
+                            aggregate, args.integer("offset", 0), args.integer("limit", 100));
+                    if (mapper.readTree(header).path("entryLimitExceeded").asBoolean()) {
+                        // glowroot stopped capturing entries (default limit 2000), counts and
+                        // totals computed from them are partial
+                        page.put("entryLimitExceeded", true);
+                        page.putArray("warnings").add("the trace hit the entry limit, later"
+                                + " entries were not captured: "
+                                + (aggregate ? "these counts are partial, " : "")
+                                + "get_trace_queries has complete query counts and times");
+                    }
                     return withUrl(mapper.writeValueAsString(page), "",
-                            traceUrl(args, backend));
+                            traceUrl(args, backend, header));
                 }));
 
         list.add(new Tool("get_trace_queries",
@@ -612,10 +627,18 @@ class McpServer {
                         + " time (executionCount helps spotting N+1 patterns). When Glowroot"
                         + " truncated the text, use get_full_query_text with fullQueryTextSha1.",
                 schema().traceAgentId().traceId(),
-                (args, backend) -> withUrl(sortQueriesByTotalTime(inlineSharedQueryTexts(
-                        checkTraceFound(backend.get("/backend/trace/queries",
-                                traceParams(args))), false)),
-                        "", traceUrl(args, backend))));
+                (args, backend) -> {
+                    String header = checkTraceFound(
+                            backend.get("/backend/trace/header", traceParams(args)));
+                    ObjectNode node = (ObjectNode) mapper.readTree(sortQueriesByTotalTime(
+                            inlineSharedQueryTexts(backend.get("/backend/trace/queries",
+                                    traceParams(args)), false)));
+                    if (mapper.readTree(header).path("queryLimitExceeded").asBoolean()) {
+                        node.put("queryLimitExceeded", true);
+                    }
+                    return withUrl(mapper.writeValueAsString(node), "",
+                            traceUrl(args, backend, header));
+                }));
 
         list.add(new Tool("get_trace_profile",
                 "Thread profile (stack samples) of a trace, summarized: sample count, hottest"
@@ -679,7 +702,23 @@ class McpServer {
                             .put("to", range[1]).putAll("gauge-name", gaugeNames);
                     ObjectNode node = (ObjectNode) mapper.readTree(
                             backend.get("/backend/jvm/gauges", params));
-                    node.remove("allGauges");
+                    JsonNode allGauges = node.remove("allGauges");
+                    List<String> known = Lists.newArrayList();
+                    if (allGauges != null) {
+                        for (JsonNode gauge : allGauges) {
+                            known.add(gauge.path("name").asText());
+                        }
+                    }
+                    ArrayNode warnings = mapper.createArrayNode();
+                    for (String gaugeName : gaugeNames) {
+                        if (!known.contains(gaugeName)) {
+                            warnings.add("no value captured for gauge " + gaugeName + " in this"
+                                    + " time range (unknown name? see list_gauges)");
+                        }
+                    }
+                    if (warnings.size() > 0) {
+                        node.set("warnings", warnings);
+                    }
                     node.put("from", range[0]);
                     node.put("to", range[1]);
                     node.put("glowrootUrl", backend.uiUrl("jvm/gauges",
@@ -694,10 +733,19 @@ class McpServer {
                 schema().agentId()
                         .stringProperty("objectName", "Exact MBean object name, e.g."
                                 + " com.zaxxer.hikari:type=Pool (HikariPool-1)", true),
-                (args, backend) -> withUrl(backend.get("/backend/jvm/mbean-attribute-map",
-                        agentIdParams(args).put("object-name",
-                                args.requiredString("objectName"))),
-                        "", null)));
+                (args, backend) -> {
+                    String objectName = args.requiredString("objectName");
+                    try {
+                        return withUrl(backend.get("/backend/jvm/mbean-attribute-map",
+                                agentIdParams(args).put("object-name", objectName)), "", null);
+                    } catch (ToolException e) {
+                        if (e.getMessage().startsWith("Not found")) {
+                            throw new ToolException("MBean not found: " + objectName
+                                    + " (use search_mbeans)");
+                        }
+                        throw e;
+                    }
+                }));
 
         // ---- jvm: threads, memory ----
 
@@ -987,6 +1035,27 @@ class McpServer {
         return json;
     }
 
+    // the chart data points (transactionCounts) include the points just outside the range, so
+    // that lines reach the chart edges, while mergedAggregate only covers (from, to]: keep the
+    // same points in both
+    private static String alignTransactionCounts(Args args, String json) throws Exception {
+        JsonNode node = mapper.readTree(json);
+        JsonNode countsNode = node.path("transactionCounts");
+        if (!(countsNode instanceof ObjectNode)) {
+            return json;
+        }
+        ObjectNode counts = (ObjectNode) countsNode;
+        long from = args.from();
+        long to = args.to();
+        for (String captureTime : Lists.newArrayList(counts.fieldNames())) {
+            long time = Long.parseLong(captureTime);
+            if (!StackedTimerTotals.captureTimeInMergedRange(time, from, to)) {
+                counts.remove(captureTime);
+            }
+        }
+        return mapper.writeValueAsString(node);
+    }
+
     private static String sortAndLimitQueries(Args args, String json) throws Exception {
         JsonNode node = mapper.readTree(json);
         if (!(node instanceof ArrayNode)) {
@@ -1035,13 +1104,15 @@ class McpServer {
         List<String> collapsed = args.stringList("collapseFramePrefixes");
         if (!args.has("collapseFramePrefixes")) {
             collapsed.addAll(DEFAULT_COLLAPSED_FRAME_PREFIXES);
-            // servlet filter chains (any framework), e.g. the portal filters
-            collapsed.add("*doFilter");
+            // servlet filter chains of any framework (e.g. the portal filters)
+            collapsed.add("*.doFilter(");
+            collapsed.add("*.doFilterInternal(");
+            collapsed.add("*FilterChain.");
         }
         Double hotPathMinPercent = args.number("hotPathMinPercent");
         return mapper.writeValueAsString(McpResponses.summarizeProfile(profile,
-                args.integer("topFrames", 15), hotPathMinPercent == null ? 5 : hotPathMinPercent,
-                collapsed));
+                args.integer("topFrames", 10), hotPathMinPercent == null ? 5 : hotPathMinPercent,
+                collapsed, args.bool("fullHotPath", false)));
     }
 
     // from/to, or the time range of a trace plus a window on each side
@@ -1145,7 +1216,7 @@ class McpServer {
             throw new ToolException("thresholdMillis is required");
         }
         if (thresholdMillis != null && thresholdMillis < 0) {
-            throw new ToolException("thresholdMillis must be positive");
+            throw new ToolException("thresholdMillis must be >= 0");
         }
         String transactionType = args.string("transactionType", "");
         String transactionName = args.string("transactionName", "");
@@ -1286,6 +1357,17 @@ class McpServer {
                 result.set("addedAttributes", added);
             }
         }
+        if (isObjectNamePattern(mbeanObjectName)) {
+            Integer matched = countMatchingMBeans(args, backend, mbeanObjectName, warnings);
+            if (matched != null) {
+                result.put("matchedMBeans", matched);
+                result.put("seriesCount", matched * attributes.size());
+                if (matched > 20) {
+                    warnings.add(matched + " MBeans match, so " + matched * attributes.size()
+                            + " series are captured: narrow the pattern unless all are needed");
+                }
+            }
+        }
         if (!warnings.isEmpty()) {
             ArrayNode warningsNode = result.putArray("warnings");
             for (String warning : warnings) {
@@ -1309,10 +1391,9 @@ class McpServer {
     private List<String> validateGauge(Args args, Backend backend, String mbeanObjectName,
             List<String> attributes) throws Exception {
         List<String> warnings = Lists.newArrayList();
-        boolean pattern = mbeanObjectName.indexOf('*') != -1 || mbeanObjectName.indexOf('?') != -1;
-        if (pattern) {
+        if (isObjectNamePattern(mbeanObjectName)) {
             warnings.add("object name pattern: one series is captured per matching MBean and"
-                    + " attribute, check how many MBeans match with search_mbeans");
+                    + " attribute (see matchedMBeans and seriesCount)");
         }
         JsonNode meta;
         try {
@@ -1344,6 +1425,42 @@ class McpServer {
             }
         }
         return warnings;
+    }
+
+    private static boolean isObjectNamePattern(String objectName) {
+        return objectName.indexOf('*') != -1 || objectName.indexOf('?') != -1;
+    }
+
+    // matched with the JMX pattern semantics, against the object names of the MBean tree
+    private @Nullable Integer countMatchingMBeans(Args args, Backend backend, String pattern,
+            List<String> warnings) throws Exception {
+        ObjectName objectNamePattern;
+        try {
+            objectNamePattern = new ObjectName(pattern);
+        } catch (MalformedObjectNameException e) {
+            throw new ToolException("Invalid MBean object name: " + pattern + " ("
+                    + e.getMessage() + ")");
+        }
+        JsonNode tree;
+        try {
+            tree = mapper.readTree(backend.get("/backend/jvm/mbean-tree", agentIdParams(args)));
+        } catch (ToolException e) {
+            warnings.add("could not count the matching MBeans: " + e.getMessage());
+            return null;
+        }
+        List<String> objectNames = Lists.newArrayList();
+        McpResponses.collectObjectNames(tree, objectNames);
+        int matched = 0;
+        for (String objectName : objectNames) {
+            try {
+                if (objectNamePattern.apply(new ObjectName(objectName))) {
+                    matched++;
+                }
+            } catch (MalformedObjectNameException e) {
+                logger.debug(e.getMessage(), e);
+            }
+        }
+        return matched;
     }
 
     private @Nullable JsonNode findGaugeConfig(Args args, Backend backend,
@@ -1459,6 +1576,13 @@ class McpServer {
         ArrayNode warnings = mapper.createArrayNode();
         JsonNode signatures =
                 validateInstrumentationTarget(args, backend, className, methodName, warnings);
+        validateTemplates(body, parameterTypes, signatures, warnings);
+        if (methodName.indexOf('*') != -1 || className.indexOf('*') != -1) {
+            warnings.add("wildcard: every matching method of " + className + " and of all its"
+                    + " subclasses / implementations is instrumented, so re-weaving and the"
+                    + " runtime overhead grow with them; the number of re-woven classes is only"
+                    + " known after apply_instrumentation_changes");
+        }
         if (args.bool("dryRun", false)) {
             ObjectNode result = mapper.createObjectNode();
             result.put("dryRun", true);
@@ -1527,6 +1651,63 @@ class McpServer {
         } catch (ToolException e) {
             warnings.add("could not validate against the JVM: " + e.getMessage());
             return mapper.createArrayNode();
+        }
+    }
+
+    private static final Pattern TEMPLATE_PLACEHOLDER = Pattern.compile("\\{\\{([^}]*)}}");
+
+    // same substitutions as the agent's MessageTemplateImpl, which silently prints anything else
+    // literally (or "<requested arg index out of bounds>")
+    private static void validateTemplates(ObjectNode body, List<String> parameterTypes,
+            JsonNode signatures, ArrayNode warnings) throws ToolException {
+        int maxArgs = -1;
+        int minArgs = -1;
+        boolean voidOnly = signatures.size() > 0;
+        if (!parameterTypes.equals(ImmutableList.of(".."))) {
+            maxArgs = parameterTypes.size();
+            minArgs = maxArgs;
+        } else {
+            for (JsonNode signature : signatures) {
+                int size = signature.path("parameterTypes").size();
+                maxArgs = Math.max(maxArgs, size);
+                minArgs = minArgs == -1 ? size : Math.min(minArgs, size);
+            }
+        }
+        for (JsonNode signature : signatures) {
+            if (!signature.path("returnType").asText().equals("void")) {
+                voidOnly = false;
+            }
+        }
+        for (String field : ImmutableList.of("traceEntryMessageTemplate",
+                "transactionNameTemplate", "transactionUserTemplate")) {
+            String template = body.path(field).asText();
+            Matcher matcher = TEMPLATE_PLACEHOLDER.matcher(template);
+            while (matcher.find()) {
+                String path = matcher.group(1).trim();
+                int index = path.indexOf('.');
+                String base = index == -1 ? path : path.substring(0, index);
+                if (base.matches("[0-9]+")) {
+                    int arg = Integer.parseInt(base);
+                    if (maxArgs != -1 && arg >= maxArgs) {
+                        throw new ToolException(field + ": {{" + path + "}} refers to argument "
+                                + arg + " but the method takes " + maxArgs + " argument(s)"
+                                + " (arguments are numbered from 0)");
+                    }
+                    if (minArgs != -1 && arg >= minArgs) {
+                        warnings.add(field + ": {{" + path + "}} only exists for the overloads"
+                                + " with more than " + arg + " argument(s)");
+                    }
+                } else if (base.equals("_")) {
+                    if (voidOnly) {
+                        throw new ToolException(field + ": {{_}} is the return value, but the"
+                                + " method returns void");
+                    }
+                } else if (!base.equals("this") && !base.equals("methodName")) {
+                    throw new ToolException(field + ": unknown placeholder {{" + path + "}},"
+                            + " use {{0}}, {{1}}... (arguments), {{this}}, {{_}} (return value)"
+                            + " or {{methodName}}, followed by .property paths");
+                }
+            }
         }
     }
 
@@ -1911,6 +2092,11 @@ class McpServer {
                 throw new ToolException("The configuration was modified concurrently, read it"
                         + " again and retry");
             }
+            if (content.contains("OptimisticLockException")) {
+                throw new ToolException("The version is stale: this configuration changed since"
+                        + " it was read, read it again (list_gauge_configs,"
+                        + " list_instrumentations, get_transaction_config) and retry");
+            }
             String message = content;
             try {
                 JsonNode node = mapper.readTree(content);
@@ -2091,12 +2277,15 @@ class McpServer {
         }
 
         private SchemaBuilder profileSummaryOptions() {
-            intProperty("topFrames", "Number of hottest frames listed (default 15)");
+            intProperty("topFrames", "Number of hottest frames listed (default 10)");
             numberProperty("hotPathMinPercent", "Stop the hot path below this share of the"
                     + " samples (default 5)");
-            stringArrayProperty("collapseFramePrefixes", "Frames hidden from the hot path"
-                    + " unless they branch (default: servlet container, filters and glowroot"
-                    + " frames; [] to show everything)", false);
+            booleanProperty("fullHotPath", "Report every frame of the hot path, not only its"
+                    + " branch points and its end (default false)");
+            stringArrayProperty("collapseFramePrefixes", "Frames left out of topFramesInclusive"
+                    + " and of the full hot path: prefixes, or *text to match anywhere"
+                    + " (default: thread, container, servlet filters, reflection and glowroot"
+                    + " frames; [] to keep everything)", false);
             return booleanProperty("raw", "Return the full profile tree instead of the summary"
                     + " (large, default false)");
         }

@@ -15,10 +15,13 @@
  */
 package org.glowroot.ui;
 
+import java.util.List;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,32 +47,79 @@ public class McpResponsesTest {
     @Test
     public void shouldSummarizeProfile() throws Exception {
         ObjectNode summary = McpResponses.summarizeProfile(mapper.readTree(PROFILE), 3, 5,
-                ImmutableList.of("java.lang.Thread.", "org.apache.catalina."));
+                ImmutableList.of("java.lang.Thread.", "org.apache.catalina."), false);
 
         assertThat(summary.path("sampleCount").asLong()).isEqualTo(100);
+        assertThat(summary.at("/warnings/0").asText()).isEmpty();
+        // the frames every sample goes through are reported once, not in the top frames
+        assertThat(summary.at("/trunk/frameCount").asInt()).isEqualTo(3);
+        assertThat(summary.at("/trunk/lastFrame").asText()).startsWith("app.Service.handle");
+        assertThat(summary.at("/topFramesInclusive/0/frame").asText())
+                .startsWith("app.Dao.query");
+        assertThat(summary.at("/topFramesInclusive/2/frame").asText())
+                .startsWith("app.View.render");
         assertThat(summary.at("/topFramesSelf/0/frame").asText())
                 .startsWith("java.net.SocketInputStream.read");
         assertThat(summary.at("/topFramesSelf/0/percent").asDouble()).isEqualTo(70.0);
-        assertThat(summary.at("/topFramesSelf/1/frame").asText()).startsWith("app.View.render");
         assertThat(summary.at("/leafThreadStates/RUNNABLE").asLong()).isEqualTo(100);
+        // only the branch point and the end of the hot path
         JsonNode hotPath = summary.path("hotPath");
-        // the collapsed trunk is not reported, the first reported frame says how much was hidden
+        assertThat(hotPath.size()).isEqualTo(2);
         assertThat(hotPath.at("/0/frame").asText()).startsWith("app.Service.handle");
-        assertThat(hotPath.at("/0/collapsedFramesAbove").asInt()).isEqualTo(2);
+        assertThat(hotPath.at("/0/framesSkippedAbove").asInt()).isEqualTo(2);
         assertThat(hotPath.at("/0/branches/0/frame").asText()).startsWith("app.Dao.query");
         assertThat(hotPath.at("/0/branches/1/percent").asDouble()).isEqualTo(30.0);
-        assertThat(hotPath.at("/2/frame").asText()).startsWith("java.net.SocketInputStream");
-        assertThat(hotPath.at("/2/leafThreadState").asText()).isEqualTo("RUNNABLE");
+        assertThat(hotPath.at("/1/frame").asText()).startsWith("java.net.SocketInputStream");
+        assertThat(hotPath.at("/1/depth").asInt()).isEqualTo(4);
+        assertThat(hotPath.at("/1/leafThreadState").asText()).isEqualTo("RUNNABLE");
+    }
+
+    @Test
+    public void shouldReportFullHotPathWithoutCollapsedFrames() throws Exception {
+        ObjectNode summary = McpResponses.summarizeProfile(mapper.readTree(PROFILE), 3, 5,
+                ImmutableList.of("java.lang.Thread.", "*WrapperValve.invoke("), true);
+
+        JsonNode hotPath = summary.path("hotPath");
+        assertThat(hotPath.size()).isEqualTo(3);
+        assertThat(hotPath.at("/0/frame").asText()).startsWith("app.Service.handle");
+        assertThat(hotPath.at("/0/framesSkippedAbove").asInt()).isEqualTo(2);
+        assertThat(hotPath.at("/1/frame").asText()).startsWith("app.Dao.query");
+    }
+
+    @Test
+    public void shouldWarnOnFewSamples() throws Exception {
+        ObjectNode summary = McpResponses.summarizeProfile(mapper.readTree(PROFILE
+                .replace("\"sampleCount\":100", "\"sampleCount\":5")
+                .replace("\"sampleCount\":70", "\"sampleCount\":3")
+                .replace("\"sampleCount\":30", "\"sampleCount\":2")), 3, 5,
+                ImmutableList.<String>of(), false);
+
+        assertThat(summary.at("/warnings/0").asText()).startsWith("only 5 samples");
     }
 
     @Test
     public void shouldSummarizeEmptyProfile() throws Exception {
         ObjectNode summary = McpResponses.summarizeProfile(
                 mapper.readTree("{\"unfilteredSampleCount\":0,\"rootNodes\":[]}"), 3, 5,
-                ImmutableList.<String>of());
+                ImmutableList.<String>of(), false);
 
         assertThat(summary.path("sampleCount").asLong()).isZero();
         assertThat(summary.has("hotPath")).isFalse();
+    }
+
+    @Test
+    public void shouldCollectObjectNamesOfMBeanTree() throws Exception {
+        List<String> objectNames = Lists.newArrayList();
+        McpResponses.collectObjectNames(mapper.readTree("{\"org.ehcache\":{\"nodeName\":"
+                + "\"org.ehcache\",\"childNodes\":[{\"nodeName\":\"CacheStatistics\","
+                + "\"childNodes\":[{\"nodeName\":\"a\",\"objectName\":"
+                + "\"org.ehcache:type=CacheStatistics,name=a\",\"expanded\":false},"
+                + "{\"nodeName\":\"b\",\"objectName\":"
+                + "\"org.ehcache:type=CacheStatistics,name=b\",\"expanded\":false}]}]}}"),
+                objectNames);
+
+        assertThat(objectNames).containsExactly("org.ehcache:type=CacheStatistics,name=a",
+                "org.ehcache:type=CacheStatistics,name=b");
     }
 
     @Test
