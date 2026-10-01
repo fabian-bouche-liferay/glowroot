@@ -280,10 +280,11 @@ class McpServer {
         if (tool == null) {
             return error(id, INVALID_PARAMS, "Unknown tool: " + name);
         }
+        // not re-assigning a JsonNode variable with an ObjectNode here (or using a ternary), since
+        // proguard (embedded build) recomputes stack map frames without seeing the shaded jackson
+        // classes, merges the two types into java.lang.Object and the class then fails verification
+        // (Args handles non-object arguments, since JsonNode.get() returns null for them)
         JsonNode arguments = params.path("arguments");
-        if (!arguments.isObject()) {
-            arguments = mapper.createObjectNode();
-        }
         ObjectNode result = mapper.createObjectNode();
         String text;
         boolean isError;
@@ -363,7 +364,10 @@ class McpServer {
                 (args, backend) -> {
                     List<String> percentiles = args.stringList("percentiles");
                     if (percentiles.isEmpty()) {
-                        percentiles = ImmutableList.of("50", "95", "99");
+                        // adding to the same list, see comment in callTool() about proguard
+                        percentiles.add("50");
+                        percentiles.add("95");
+                        percentiles.add("99");
                     }
                     return stripChartSeries(args,
                             backend.get("/backend/transaction/percentiles",

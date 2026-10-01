@@ -652,7 +652,10 @@ public class CommonHandler {
         @Override
         public List<String> getParameters(String name) {
             List<String> values = parameters.get(name);
-            return values == null ? ImmutableList.<String>of() : values;
+            if (values == null) {
+                return ImmutableList.of();
+            }
+            return values;
         }
 
         @Override
